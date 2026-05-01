@@ -1,0 +1,28 @@
+{
+  "name": "magol-llm-adventure",
+  "version": "1.0.0",
+  "description": "在线多人 LLM 文字冒险平台",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-session": "^1.18.0",
+    "socket.io": "^4.7.5"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "llm",
+    "text-adventure",
+    "multiplayer",
+    "socket.io"
+  ],
+  "license": "MIT"
+}

@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MAGOL｜在线 LLM 文字冒险</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="noise"></div>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+    <div id="startSetupModal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="startSetupTitle">
+      <section class="modal-card brutal-card">
+        <div class="modal-header">
+          <div>
+            <p class="eyebrow">GAME SETUP</p>
+            <h2 id="startSetupTitle">选择开局生成方式</h2>
+          </div>
+          <button id="closeStartSetupButton" class="ghost-btn small" type="button" aria-label="关闭开局设置">×</button>
+        </div>
+
+        <div class="play-mode-section">
+          <p class="eyebrow">GAME MODE</p>
+          <div class="play-mode-tabs" role="tablist" aria-label="游戏模式">
+            <button class="play-mode-option active" type="button" data-play-mode="cooperative">🤝 合作</button>
+            <button class="play-mode-option" type="button" data-play-mode="independent">🧭 独立</button>
+            <button class="play-mode-option" type="button" data-play-mode="pvp">⚔️ PVP</button>
+          </div>
+          <p id="playModeHint" class="mode-hint">合作模式：玩家信息共享，共同完成目标。</p>
+        </div>
+
+        <div class="setup-tabs" role="tablist" aria-label="开局生成方式">
+          <button class="setup-option active" type="button" data-setup-mode="random">🎲 全随机生成</button>
+          <button class="setup-option" type="button" data-setup-mode="brief">💬 一句话描述</button>
+          <button class="setup-option" type="button" data-setup-mode="detailed">🧩 详细设定参数</button>
+        </div>
+
+        <form id="startSetupForm" class="setup-form">
+          <section id="randomSetupPanel" class="setup-panel">
+            <p>让 LLM 完全自由创作世界、角色、目标与开场，适合快速开始。</p>
+          </section>
+
+          <section id="briefSetupPanel" class="setup-panel hidden">
+            <label>
+              <span>一句话描述</span>
+              <textarea id="briefSetupInput" rows="3" maxlength="260" placeholder="例如：一群失忆旅人在会移动的图书馆里追捕偷走黎明的猫。"></textarea>
+            </label>
+          </section>
+
+          <section id="detailedSetupPanel" class="setup-panel hidden">
+            <div class="setup-grid">
+              <label>
+                <span>标题/关键词</span>
+                <input id="detailTitleInput" maxlength="90" placeholder="例如：钟表海盗团" />
+              </label>
+              <label>
+                <span>类型/主题</span>
+                <input id="detailGenreInput" maxlength="140" placeholder="蒸汽朋克、悬疑、轻喜剧……" />
+              </label>
+              <label class="wide">
+                <span>世界与当前处境</span>
+                <textarea id="detailSettingInput" rows="3" maxlength="1200" placeholder="写下世界观、起点场景、重要势力或禁忌。"></textarea>
+              </label>
+              <label class="wide">
+                <span>共同目标</span>
+                <textarea id="detailGoalInput" rows="2" maxlength="500" placeholder="例如：在三天内修复灯塔，否则城市会坠入梦境海。"></textarea>
+              </label>
+              <label>
+                <span>叙事风格</span>
+                <input id="detailToneInput" maxlength="180" placeholder="黑色幽默、热血、诡谲童话……" />
+              </label>
+              <label>
+                <span>难度/危险度</span>
+                <input id="detailDifficultyInput" maxlength="120" placeholder="轻松 / 标准 / 高压 / 自定义" />
+              </label>
+              <label class="wide">
+                <span>角色偏好</span>
+                <textarea id="detailCharactersInput" rows="2" maxlength="260" placeholder="例如：玩家都是被同一预言选中的普通人，Bot 更偏辅助。"></textarea>
+              </label>
+              <label class="wide">
+                <span>额外规则或限制</span>
+                <textarea id="detailRulesInput" rows="2" maxlength="360" placeholder="例如：低魔、不能复活、强调资源管理、不要恐怖元素。"></textarea>
+              </label>
+            </div>
+          </section>
+
+          <div class="modal-actions">
+            <button id="cancelStartSetupButton" class="ghost-btn" type="button">取消</button>
+            <button id="confirmStartSetupButton" class="primary-btn" type="submit">开始生成</button>
+          </div>
+        </form>
+      </section>
+    </div>
+
+    <main id="authView" class="auth-screen">
+      <section class="auth-hero brutal-card">
+        <div class="logo-mark">M</div>
+        <p class="eyebrow">MULTIPLAYER · AI GAME MASTER</p>
+        <h1>MAGOL</h1>
+        <p class="hero-copy">登录、组队、开房，让 LLM 自动生成世界设定、角色目标，并作为 GM 推进多人回合制文字冒险。</p>
+        <div class="feature-grid">
+          <span>3 分钟回合</span>
+          <span>Discord-like 游戏界面</span>
+          <span>OpenAI-compatible Provider</span>
+        </div>
+      </section>
+
+      <section class="auth-panel brutal-card">
+        <div class="auth-tabs" role="tablist">
+          <button id="loginTab" class="tab active" type="button">登录</button>
+          <button id="registerTab" class="tab" type="button">注册</button>
+        </div>
+        <form id="authForm" class="stack">
+          <label>
+            <span>用户名</span>
+            <input id="usernameInput" name="username" autocomplete="username" required minlength="3" maxlength="20" placeholder="例如：纸月骑士" />
+          </label>
+          <label>
+            <span>密码</span>
+            <input id="passwordInput" name="password" type="password" autocomplete="current-password" required minlength="6" maxlength="72" placeholder="至少 6 位" />
+          </label>
+          <button id="authSubmit" class="primary-btn" type="submit">进入大厅</button>
+        </form>
+        <p class="hint">用户名支持中文、字母、数字、下划线和短横线。</p>
+      </section>
+    </main>
+
+    <div id="appView" class="app-shell hidden">
+      <aside class="server-rail">
+        <button id="toLobbyButton" class="server-pill active" title="大厅">大厅</button>
+        <div class="rail-line"></div>
+        <button id="currentRoomPill" class="server-pill room-pill hidden" title="当前房间">桌</button>
+        <div class="rail-spacer"></div>
+        <div id="connectionDot" class="connection-dot" title="连接状态"></div>
+      </aside>
+
+      <section id="lobbyView" class="lobby-view">
+        <header class="topbar brutal-card flat">
+          <div>
+            <p class="eyebrow">LOBBY</p>
+            <h2>冒险大厅</h2>
+          </div>
+          <div class="user-chip">
+            <span id="meName">-</span>
+            <button id="logoutButton" class="ghost-btn" type="button">退出</button>
+          </div>
+        </header>
+
+        <section id="resumeRoomCard" class="resume-card brutal-card hidden">
+          <div>
+            <p class="eyebrow">CURRENT TABLE</p>
+            <h3 id="resumeRoomName">当前房间</h3>
+            <p id="resumeRoomMeta">正在同步……</p>
+          </div>
+          <button id="resumeRoomButton" class="primary-btn small" type="button">回到房间</button>
+        </section>
+
+        <section class="create-room brutal-card">
+          <div>
+            <p class="eyebrow">CREATE</p>
+            <h3>创建房间</h3>
+            <p>房间会显示在大厅；房主可决定何时开始。</p>
+          </div>
+          <form id="createRoomForm" class="create-form">
+            <input id="roomNameInput" maxlength="32" placeholder="房间名（可选）" />
+            <button class="primary-btn" type="submit">创建</button>
+          </form>
+        </section>
+
+        <section class="room-list-panel brutal-card">
+          <div class="section-title">
+            <div>
+              <p class="eyebrow">ROOMS</p>
+              <h3>公开房间</h3>
+            </div>
+            <span id="roomCount" class="badge">0</span>
+          </div>
+          <div id="roomList" class="room-list"></div>
+        </section>
+      </section>
+
+      <section id="gameView" class="game-view hidden">
+        <div id="drawerOverlay" class="drawer-overlay hidden"></div>
+        <aside class="channel-panel brutal-card flat">
+          <div class="room-title-block">
+            <button id="closeLeftDrawerButton" class="ghost-btn block mobile-only" type="button">关闭侧栏</button>
+            <button id="backToLobbyButton" class="ghost-btn block" type="button">← 大厅</button>
+            <p class="eyebrow">TABLE</p>
+            <h2 id="gameRoomName">房间</h2>
+            <div class="room-code">CODE <strong id="gameRoomCode">------</strong></div>
+          </div>
+
+          <nav class="channel-list" aria-label="游戏频道">
+            <div class="channel active"># 冒险记录</div>
+            <div class="channel"># 回合行动</div>
+            <div class="channel"># 队伍状态</div>
+          </nav>
+
+          <div class="players-block">
+            <div class="section-title compact">
+              <span>玩家</span>
+              <span id="playerCountBadge" class="badge">0/8</span>
+            </div>
+            <div id="playerList" class="player-list"></div>
+          </div>
+        </aside>
+
+        <main class="chat-panel brutal-card flat">
+          <header class="chat-header">
+            <button id="openLeftDrawerButton" class="ghost-btn small mobile-only" type="button" data-mobile-icon="☰" aria-label="打开队伍侧栏" title="队伍">☰ 队伍</button>
+            <div class="chat-title-block">
+              <p id="gameStatusLine" class="eyebrow">WAITING</p>
+              <h2 id="gameTitle">等待开局</h2>
+            </div>
+            <div class="header-actions">
+              <button id="openRightDrawerButton" class="ghost-btn small mobile-only" type="button" data-mobile-icon="📜" aria-label="打开冒险档案" title="档案">档案</button>
+              <button id="addBotButton" class="ghost-btn small hidden" type="button" data-mobile-icon="＋" aria-label="添加 LLM Bot 队友" title="添加 Bot">+Bot</button>
+              <button id="retryLlmButton" class="primary-btn small hidden" type="button" data-mobile-icon="↺" aria-label="重试 LLM" title="重试 LLM">重试 LLM</button>
+              <button id="startGameButton" class="primary-btn small hidden" type="button" data-mobile-icon="▶" aria-label="开始游戏" title="开始游戏">开始游戏</button>
+              <button id="endAdventureButton" class="danger-btn small hidden" type="button" data-mobile-icon="■" aria-label="中止冒险" title="中止冒险">中止冒险</button>
+              <button id="deleteRoomButton" class="danger-btn small hidden" type="button" data-mobile-icon="🗑" aria-label="删除房间" title="删除房间">删除房间</button>
+              <button id="leaveRoomButton" class="danger-btn small" type="button" data-mobile-icon="↩" aria-label="离开房间" title="离开">离开</button>
+            </div>
+          </header>
+
+          <div class="message-list-wrap">
+            <div id="messageList" class="message-list" aria-live="polite"></div>
+            <button id="newMessagesButton" class="new-messages-pill hidden" type="button">↓ 0 条新消息</button>
+          </div>
+
+          <footer class="composer-wrap">
+            <div id="progressTrack" class="turn-progress hidden">
+              <div id="progressFill" class="turn-progress-fill"></div>
+            </div>
+            <div class="composer-meta">
+              <span id="turnHint">等待房主开始游戏。</span>
+              <span id="turnClock">--:--</span>
+            </div>
+            <textarea id="composerInput" rows="3" maxlength="700" placeholder="输入本回合行动，例如：调查机械乌鸦的眼睛。"></textarea>
+            <div class="composer-actions">
+              <button id="sendChatButton" class="ghost-btn" type="button">发送聊天</button>
+              <button id="submitActionButton" class="primary-btn" type="button">提交行动</button>
+            </div>
+          </footer>
+        </main>
+
+        <aside class="dossier-panel brutal-card flat">
+          <button id="closeRightDrawerButton" class="ghost-btn block mobile-only" type="button">关闭档案</button>
+          <p class="eyebrow">DOSSIER</p>
+          <h2>冒险档案</h2>
+          <div id="dossierContent" class="dossier-content"></div>
+        </aside>
+      </section>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
