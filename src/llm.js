@@ -16,6 +16,13 @@ const GAME_MODE_LABELS = {
 const PRIVATE_INFO_MODES = new Set(['independent', 'pvp']);
 const DEFAULT_LOCATION = { id: 'together', label: '同一地点' };
 const PERCEPTION_BLOCKED_STATUS_RE = /(死亡|休克|昏迷|晕倒|无意识|失去意识|沉睡)/;
+const MAX_TOOL_JSON_RETRY_REQUESTS = 3;
+const LLM_DEBUG_CONSOLE_STRING_LIMIT = 700;
+let llmDebugLogWarned = false;
+
+function envFlag(name) {
+  return /^(1|true|yes|on)$/i.test(String(process.env[name] || '').trim());
+}
 
 function providerName() {
   return (process.env.LLM_PROVIDER || (process.env.LLM_API_KEY ? 'openai-compatible' : 'mock')).trim().toLowerCase();
@@ -149,6 +156,18 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+class RetryableLlmFormatError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'RetryableLlmFormatError';
+    this.retryableLlmFormatError = true;
+  }
+}
+
+function isRetryableLlmFormatError(error) {
+  return Boolean(error?.retryableLlmFormatError);
+}
+
 function clampNumber(value, fallback = 0, min = 0, max = 9999) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
@@ -250,12 +269,22 @@ function randomToolDefinition() {
 }
 
 function parseToolArguments(value) {
-  if (!value) return {};
-  if (typeof value === 'object') return value;
+  if (!value) return { ok: false, args: {}, error: '工具参数为空，必须是严格 JSON 对象。', raw: '' };
+  if (typeof value === 'object') return { ok: true, args: value, error: '', raw: '' };
+  const raw = String(value || '').trim();
   try {
-    return JSON.parse(value);
-  } catch {
-    return {};
+    const args = JSON.parse(raw);
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+      return { ok: false, args: {}, error: '工具参数必须是 JSON 对象。', raw };
+    }
+    return { ok: true, args, error: '', raw };
+  } catch (error) {
+    return {
+      ok: false,
+      args: {},
+      error: `工具参数不是合法 JSON：${error instanceof Error ? error.message : String(error)}`,
+      raw,
+    };
   }
 }
 
@@ -277,10 +306,33 @@ function messageContentToText(content) {
 
 function executeToolCall(toolCall) {
   const name = toolCall?.function?.name;
-  const args = parseToolArguments(toolCall?.function?.arguments);
+  const parsed = parseToolArguments(toolCall?.function?.arguments);
 
   if (name !== 'roll_random') {
     return { ok: false, error: `Unknown tool: ${name || 'unknown'}` };
+  }
+
+  if (!parsed.ok) {
+    return {
+      ok: false,
+      tool: 'roll_random',
+      retryable: true,
+      error: parsed.error,
+      instruction: '请重新发起 roll_random 工具调用；function.arguments 必须是严格 JSON 对象，且必须包含 reason 字符串。不要在 arguments 中输出 Markdown、注释、尾随逗号或自然语言。',
+      rawArgumentsPreview: clampText(parsed.raw, 300),
+    };
+  }
+
+  const args = parsed.args;
+  if (!clampText(args.reason, 180)) {
+    return {
+      ok: false,
+      tool: 'roll_random',
+      retryable: true,
+      error: 'roll_random.arguments.reason 缺失或为空。',
+      instruction: '请重新发起 roll_random 工具调用；arguments 必须是严格 JSON 对象并包含非空 reason 字符串。',
+      rawArgumentsPreview: clampText(JSON.stringify(args), 300),
+    };
   }
 
   const min = Math.floor(clampNumber(args.min ?? 1, 1, 0, 9999));
@@ -391,13 +443,32 @@ async function callOpenAICompatibleOnce(messages, { temperature, timeoutMs, tool
           tool_calls: message.tool_calls,
         };
         if (message.reasoning_content) assistantToolMessage.reasoning_content = message.reasoning_content;
+        const toolResults = message.tool_calls.map((toolCall) => ({ toolCall, result: executeToolCall(toolCall) }));
+        const hasRetryableToolJsonError = toolResults.some(({ result }) => result?.retryable);
+        if (hasRetryableToolJsonError) {
+          toolJsonRetryRequests += 1;
+          if (toolJsonRetryRequests > maxToolJsonRetryRequests) {
+            throw new RetryableLlmFormatError(`LLM 工具调用参数 JSON 连续 ${maxToolJsonRetryRequests} 次无效。`);
+          }
+          console.warn(`[llm] tool arguments JSON invalid; asking model to retry tool call (${toolJsonRetryRequests}/${maxToolJsonRetryRequests}).`);
+        } else {
+          successfulToolRounds += 1;
+          if (successfulToolRounds > maxToolRounds) throw new Error('LLM requested too many tool rounds');
+        }
+
         workingMessages.push(assistantToolMessage);
-        for (const toolCall of message.tool_calls) {
+        for (const { toolCall, result } of toolResults) {
           workingMessages.push({
             role: 'tool',
             tool_call_id: toolCall.id,
             name: toolCall.function?.name,
-            content: JSON.stringify(executeToolCall(toolCall)),
+            content: JSON.stringify(result),
+          });
+        }
+        if (hasRetryableToolJsonError) {
+          workingMessages.push({
+            role: 'user',
+            content: '上一次工具调用的 function.arguments 不是可执行的严格 JSON 或缺少必填字段。请立即重新发起需要的工具调用，arguments 必须是严格 JSON 对象，例如 {"reason":"检定原因","min":1,"max":20}。不要输出最终叙事，不要省略工具调用。',
           });
         }
         continue;
@@ -437,6 +508,7 @@ async function callOpenAICompatible(messages, options = {}) {
     try {
       return await callOpenAICompatibleOnce(messages, options);
     } catch (error) {
+      if (isRetryableLlmFormatError(error)) throw error;
       lastError = error;
       console.error(`[llm] request attempt ${attempt + 1}/${retries + 1} failed:`, error);
       if (attempt < retries) await sleep(Math.min(6000, 800 * 2 ** attempt));
@@ -628,11 +700,29 @@ function normalizeSetup(payload, players, setupOptions = {}) {
 }
 
 function normalizeStoryToolCalls(calls) {
-  if (!Array.isArray(calls)) return [];
-  return calls
-    .map((call) => {
-      const tool = clampText(call?.tool || call?.name || 'updateCharacter', 80);
-      const args = call?.args && typeof call.args === 'object' ? call.args : call?.arguments && typeof call.arguments === 'object' ? call.arguments : {};
+  if (calls === undefined || calls === null || calls === '') return [];
+  let rawCalls = calls;
+  if (typeof rawCalls === 'string') {
+    try {
+      rawCalls = JSON.parse(rawCalls);
+    } catch (error) {
+      throw new RetryableLlmFormatError(`storyProgressToolCalls 不是合法 JSON 数组：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (!Array.isArray(rawCalls) && rawCalls && typeof rawCalls === 'object') {
+    rawCalls = rawCalls.calls || rawCalls.items || rawCalls.storyProgressToolCalls || rawCalls.toolCalls;
+  }
+  if (!Array.isArray(rawCalls)) throw new RetryableLlmFormatError('storyProgressToolCalls 必须是数组，不能是自然语言或对象。');
+  return rawCalls
+    .map((call, index) => {
+      if (!call || typeof call !== 'object') throw new RetryableLlmFormatError(`storyProgressToolCalls[${index}] 必须是对象。`);
+      const tool = clampText(call.tool || call.name || 'updateCharacter', 80);
+      const args = call.args && typeof call.args === 'object' && !Array.isArray(call.args)
+        ? call.args
+        : call.arguments && typeof call.arguments === 'object' && !Array.isArray(call.arguments)
+          ? call.arguments
+          : null;
+      if (!args) throw new RetryableLlmFormatError(`storyProgressToolCalls[${index}].args 必须是 JSON 对象。`);
       return { tool, args };
     })
     .filter((call) => /updateCharacter|update_character/i.test(call.tool))
@@ -1148,8 +1238,23 @@ export async function generateTurnNarration({ room, actions, timedOutUsers, unab
   ];
 
   try {
-    const payload = await callOpenAICompatible(messages, { tools: [randomToolDefinition()], maxToolRounds: 4 });
-    return { ...normalizeTurn(payload), provider: providerName() };
+    let lastFormatError;
+    for (let attempt = 1; attempt <= MAX_TOOL_JSON_RETRY_REQUESTS; attempt += 1) {
+      const payload = await callOpenAICompatible(messages, { tools: [randomToolDefinition()], maxToolRounds: 4, maxToolJsonRetryRequests: MAX_TOOL_JSON_RETRY_REQUESTS });
+      try {
+        return { ...normalizeTurn(payload), provider: providerName() };
+      } catch (error) {
+        if (!isRetryableLlmFormatError(error)) throw error;
+        lastFormatError = error;
+        console.warn(`[llm] storyProgressToolCalls JSON invalid; retrying full turn request (${attempt}/${MAX_TOOL_JSON_RETRY_REQUESTS}).`, error.message);
+        if (attempt >= MAX_TOOL_JSON_RETRY_REQUESTS) throw error;
+        messages.push({
+          role: 'user',
+          content: '上一次回复中的 storyProgressToolCalls / toolCalls JSON 格式无效，服务器无法落库关键状态变化。请重新输出完整最终 JSON：storyProgressToolCalls 必须是数组，每项必须是 {"tool":"updateCharacter","args":{...}}，args 必须是 JSON 对象；不要把该字段写成字符串、Markdown 或自然语言。',
+        });
+      }
+    }
+    throw lastFormatError || new Error('storyProgressToolCalls JSON 格式重试失败。');
   } catch (error) {
     console.error('[llm] turn generation failed after retries:', error);
     throw error;
