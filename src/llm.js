@@ -928,6 +928,18 @@ function mockBotChatReply({ bot, triggerMessage }) {
   return options[Math.floor(Math.random() * options.length)];
 }
 
+function normalizeBotWaitUntil(input) {
+  if (!input) return { type: 'activity', username: '' };
+  if (typeof input === 'string') return { type: clampText(input, 40) || 'activity', username: '' };
+  if (input && typeof input === 'object') {
+    return {
+      type: clampText(input.type || input.event || input.kind || input.mode || 'activity', 40) || 'activity',
+      username: clampText(input.username || input.player || input.bot || input.target || '', 80),
+    };
+  }
+  return { type: 'activity', username: '' };
+}
+
 function normalizeBotTurnDecision(payload, fallbackAction = '') {
   if (typeof payload === 'string') return { decision: 'action', text: clampText(payload || fallbackAction, 700), reason: '' };
   const rawDecision = String(payload?.decision || payload?.type || payload?.kind || '').trim().toLowerCase();
@@ -942,17 +954,27 @@ function normalizeBotTurnDecision(payload, fallbackAction = '') {
     action: 'action',
     act: 'action',
     submit: 'action',
+    wait: 'wait',
+    sleep: 'wait',
+    pause: 'wait',
+    hold: 'wait',
     stop: 'stop',
-    wait: 'stop',
-    sleep: 'stop',
     idle: 'stop',
   };
   const decision = aliases[rawDecision] || (payload?.action ? 'action' : 'stop');
   const text = clampText(payload?.text || payload?.message || payload?.utterance || payload?.question || payload?.action || fallbackAction, decision === 'action' ? 700 : 360);
+  const waitMs = clampNumber(
+    payload?.waitMs ?? payload?.durationMs ?? payload?.timeoutMs ?? (payload?.seconds !== undefined ? Number(payload.seconds) * 1000 : undefined),
+    8000,
+    1000,
+    30000
+  );
   return {
     decision,
     text,
     reason: clampText(payload?.reason || '', 240),
+    waitMs,
+    waitUntil: normalizeBotWaitUntil(payload?.waitUntil || payload?.until),
   };
 }
 
@@ -1119,7 +1141,7 @@ export async function generateBotTurnDecision({ room, bot, recentMessages, step 
   const messages = [
     {
       role: 'system',
-      content: '你正在扮演多人文字冒险中的 LLM Bot 玩家角色。你不是 GM，不能宣布行动结果、世界事实、隐藏线索、检定结果或 NPC 反应。你需要像真人队友一样决定当前是否先说话、向 GM 询问有限信息、提交本回合行动，或停止主动推进等待玩家唤醒。必须尊重服务器记录的状态、物品、位置与信息权限。独立/PVP 模式下只能利用本角色知道的信息、同空间可观察/可听见的信息和实际收到的说话。只输出严格 JSON。',
+      content: '你正在扮演多人文字冒险中的 LLM Bot 玩家角色。你不是 GM，不能宣布行动结果、世界事实、隐藏线索、检定结果或 NPC 反应。你需要像真人队友一样决定当前是否先说话、向 GM 询问有限信息、调用等待工具等待其他 LLM Bot/真人玩家回应或行动、提交本回合行动，或停止主动推进等待玩家唤醒。必须尊重服务器记录的状态、物品、位置与信息权限。独立/PVP 模式下只能利用本角色知道的信息、同空间可观察/可听见的信息和实际收到的说话。只输出严格 JSON。',
     },
     {
       role: 'user',
@@ -1138,18 +1160,20 @@ export async function generateBotTurnDecision({ room, bot, recentMessages, step 
 请决定该 Bot 下一步做什么：
 - say：主动说一句队伍内/同空间能听见的话；用于同步计划、回应局势、提醒风险、请求队友确认。不能替 GM 判定结果。text 是要说的话。
 - ask：向 GM 询问当前视角下有限信息；只有 inquiryRemaining > 0 时可选。问题不能要求剧透或越权信息。text 是问 GM 的问题。
+- wait：调用等待工具，暂不提交行动，给其他 LLM Bot 或真人玩家时间回答/提交。适合你刚刚 say 提问、需要等某人表态、想等某人提交行动后再决定，或希望固定等待几秒观察。waitMs 为最长等待毫秒（1000-30000）；until 可写 {"type":"time|message|action|activity|human_message|bot_message|human_action|bot_action","username":"可选具体玩家/Bot 名"}。type=time 表示只等固定时间；activity 表示等任意发言或行动，超时也会继续。
 - action：提交本回合最终行动；一旦提交，本回合不能再改。text 是行动文本，只写本角色尝试做什么/说什么，不要替 GM 判定结果。
-- stop：停止主动推进，进入等待状态；之后真人玩家说话/点名/询问可以重新唤醒你。在 stop 前如果还有必要，可以先用 say 或 ask。text 可写一句极短说明，也可以为空。
+- stop：停止主动推进并提交“待命/观察”作为本回合行动；之后真人玩家说话/点名/询问可以重新唤醒你。在 stop 前如果还有必要，可以先用 say、ask 或 wait。text 可写一句极短说明，也可以为空。
 
 决策原则：
-- 不要一上来总是 action；如果队伍信息不足、计划不清或风险明显，可以先 say 或 ask。
-- 不要刷屏；连续说话/询问最多几步，接近 maxSteps 时优先 action 或 stop。
+- 不要一上来总是 action；如果队伍信息不足、计划不清或风险明显，可以先 say、ask 或 wait。
+- say 后若你真心需要玩家/Bot 回答，不要立刻 action；优先 wait 一小段时间或等特定人发言/行动。
+- 不要刷屏；连续说话/询问/等待最多几步，接近 maxSteps 时优先 action 或 stop。
 - 如果玩家已经给出明确方向，优先配合提交 action。
 - 如果没有新信息、继续主动会抢玩家节奏或拖慢游戏，选择 stop。
 - 独立/PVP 模式下不要跨空间直接互动，除非有明确通信手段；不要泄露秘密目标或其他空间信息。
 - 中文，say/ask 最多 120 字，action 1-3 句。
 
-返回 JSON：{"decision":"say|ask|action|stop","text":"对应文本","reason":"简短说明"}`,
+返回 JSON：{"decision":"say|ask|wait|action|stop","text":"对应文本；wait 可为空","waitMs":8000,"until":{"type":"activity","username":""},"reason":"简短说明"}`,
     },
   ];
 
@@ -1447,11 +1471,11 @@ export async function generateTurnNarration({ room, actions, timedOutUsers, unab
   const messages = [
     {
       role: 'system',
-      content: `你是一个中文多人文字冒险 GM。根据玩家行动推进剧情：尊重玩家意图但制造代价、线索和新选择。合理地模拟虚拟世界中的交互、化用数学、逻辑学谜题创造真实需要思考解决的挑战，以及模拟虚拟世界中的NPC交流、战斗场景等。你必须尊重既有故事背景、当前状态、物品栏、状态标签、属性数值、空间位置和客观事实。玩家只能声明“尝试/意图/说的话”，不能通过行动文本编造已发生事实、NPC反应、隐藏线索、战利品、自己拥有的物品或世界规则；遇到越权编造时，应将其视为尝试、误判、谎称或失败，并给出合理后果。你应积极使用工具：凡是行动存在明显风险、不确定成败、对抗、搜索发现、躲避、说服、战斗、伤害、治疗、资源消耗、获得/丢失物品、状态改变或空间移动，都优先调用 roll_random 工具或在最终 JSON 的 storyProgressToolCalls 中记录状态/位置变更；不要只用 narration 描述状态变化。${privacySystem}最终只输出严格 JSON。`,
+      content: `你是一个中文多人文字冒险 GM。根据玩家行动推进剧情：尊重玩家意图但制造代价、线索和新选择。合理地模拟虚拟世界中的交互、化用数学、逻辑学谜题创造真实需要思考解决的挑战，以及模拟虚拟世界中的NPC交流、战斗场景等。你必须尊重既有故事背景、当前状态、物品栏、状态标签、属性数值、空间位置和客观事实。玩家只能声明“尝试/意图/说的话”，不能通过行动文本编造已发生事实、NPC反应、隐藏线索、战利品、自己拥有的物品或世界规则；遇到越权编造时，应将其视为尝试、误判、谎称或失败，并给出合理后果。你应积极使用工具：凡是行动存在明显风险、不确定成败、对抗、搜索发现、躲避、说服、战斗、伤害、治疗、资源消耗、获得/丢失物品、状态改变或空间移动，都优先调用 roll_random 工具或在最终 JSON 的 storyProgressToolCalls 中记录状态/位置变更；不要只用 narration 描述状态变化。硬性要求：任何会改变服务器权威状态的叙事都必须落实为 storyProgressToolCalls 的 updateCharacter 调用；如果写“受伤/流血/中毒/昏迷/休克/死亡/力竭/恢复/获得或失去物品/移动到新地点/消耗资源”等，就必须同步写入 statsDelta 或 statsSet、statusAdd/statusRemove、inventoryAdd/inventoryRemove、location 等字段。禁止出现“文本里说受伤、服务器状态却没变化”的结果；不想改变状态就不要在播报中写成已经发生的状态变化。${privacySystem}最终只输出严格 JSON。`,
     },
     {
       role: 'user',
-      content: `游戏标题：${room.game?.title}\n世界设定：${room.game?.setting}\n公开目标/局势：${room.game?.globalGoal}\n游戏模式：${gameModeLabel(playMode)}\n当前回合：${room.turnNumber}\n玩家权威状态（服务器记录，以此为准；包含真实角色/目标/物品/状态/空间，仅 GM 可见）：${JSON.stringify(playerSummary)}\n当前空间分组（同组才能自然听见说话/看见近处行动）：${JSON.stringify(locationGroups)}\n历史消息上下文（按估算 token 预算尽量纳入，越靠后越新；say 消息的 audienceUsernames 是实际听见的人）：${JSON.stringify(historyContext.messages)}\n历史消息纳入情况：${JSON.stringify({ totalMessages: historyContext.totalMessages, includedMessages: historyContext.includedMessages, omittedOlderMessages: historyContext.omittedOlderMessages, estimatedMessageTokens: historyContext.estimatedMessageTokens, messageTokenBudget: historyContext.messageTokenBudget, totalContextTokenBudget: historyContext.totalContextTokenBudget })}\n本回合行动（仅代表玩家尝试，不代表事实已成立；location 是提交行动时所在空间）：${JSON.stringify(actions)}\n超时未行动玩家：${JSON.stringify(timedOutUsers)}\n因死亡/体力耗尽/昏迷等无法行动玩家：${JSON.stringify(unableUsers)}\n\n服务器规则：\n- hp/生命值 <= 0 会死亡并无法行动。某些世界观可以复活；只要通过故事进展工具把 hp 调回 >0，就会从死亡中恢复。\n- stamina/体力 <= 0 会进入“力竭”并无法行动；但如果角色只是因体力耗尽倒下，且没有“受伤/重伤/流血/骨折/中毒/休克/昏迷”等伤病或无意识状态，应允许短暂喘息后的自然体力恢复。不要把单纯力竭写成永久昏迷或无法自然恢复；通常在 1 回合左右用 statsDelta 或 statsSet 把 stamina 恢复到至少 1，并移除“力竭”。\n- “休克”是用于重击、坠落、爆震、严重创伤、窒息等导致晕倒/意识中断的状态开关：需要时用 statusAdd:["休克"]（可配合 hp/stamina 变化）；休克/昏迷/晕倒会无法行动且无法感知，持续应比单纯力竭更久，通常需要同伴唤醒、急救、稳定体征或安全环境后才能用 statusRemove 移除。\n- 状态标签包含“休克/昏迷/晕倒/无意识/无法行动/瘫痪/石化/沉睡/眩晕/麻痹”等会无法行动；其中休克/昏迷/晕倒/沉睡/死亡还代表无法获取外界信息。\n- 物品栏、状态标签、属性数值的真实改变，必须放在 storyProgressToolCalls 中；只在 narration 里描述不会改变服务器状态。\n- 工具使用倾向：只要存在风险、不确定成败、对抗、搜索发现、躲避、说服、战斗、伤害、治疗、资源消耗、获得/丢失物品、状态改变或空间移动，就优先使用工具。概率/检定/风险事件先调用 roll_random；生命值、体力、额外属性、物品栏、状态标签和位置变化必须写入 storyProgressToolCalls。位置变化写在对应 updateCharacter.args.location（如 {"id":"archive","label":"档案室"}）。\n\n请输出下一段 GM 播报。要求：\n- 汇总所有有效行动并给出后果；对越权编造事实的行动要纠正为“尝试”并按背景和客观事实裁定。\n- ${privateMode ? '必须为每一名玩家输出 privateNarrations；每段严格按该玩家视角写，只包含其所在空间可见/可听、自己已知、或通过明确通信手段获得的信息。对休克/昏迷/晕倒/沉睡/死亡等无感知角色，只能写意识中断、黑暗、断片体感或等待救助，不能让其听见、看见、推理或获取外界新信息。绝对不要泄露其他空间行动、秘密目标、隐藏身份、未听到的说话或未观察到的状态变化。narration 字段只能写 GM 内部摘要/公开安全摘要。' : '合作模式下 narration 是全队可见播报。'}\n- 如果有人超时或无法行动，用剧情方式轻微体现但不要羞辱。\n- 结尾给出清晰的新局势/可行动钩子，让仍可行动玩家下一回合都有事可做。\n- 主动、频繁地使用 storyProgressToolCalls 调整角色的生命值、体力、额外属性、物品栏、状态标签和 location。常见行动可消耗 stamina，受伤扣 hp，获得/丢失物品修改 inventory，移动/分散/汇合修改 location；不要让这些变化只停留在 narration。\n${mvpRequirement}\n- 可以让危险升级，但不要突然结束，除非剧情自然达成目标。\n- 中文，生动但精炼。\n\n最终返回 JSON：\n{\n  "narration": "合作模式的全队播报；独立/PVP 可写公开安全摘要，不要含秘密",${privateOutputSchema}\n  "stateChanges": "状态变化摘要",\n  "storyProgressToolCalls": [\n    {\n      "tool":"updateCharacter",\n      "args":{\n        "username":"玩家名",\n        "reason":"为什么这样修改",\n        "statsDelta":{"hp":-2,"stamina":-1,"mana":-1},\n        "statsSet":{"hunger":{"label":"饱食度","value":3,"max":6}},\n        "inventoryAdd":["新物品"],\n        "inventoryRemove":["消耗或丢失的物品"],\n        "statusAdd":["受伤"],\n        "statusRemove":["力竭"],\n        "location":{"id":"new-space", "label":"新空间/地点名"}\n      }\n    }\n  ],\n  "spotlight": {"username":"可选被聚焦玩家", "text":"可选聚焦内容"} 或 null,\n  "gameOver": false,\n  "ending": "如果 gameOver 为 true，填写结局；否则空字符串",\n  "mvp": {"username":"独立模式 gameOver=true 时填写 MVP 玩家名", "reason":"评选理由"} 或 null\n}`,
+      content: `游戏标题：${room.game?.title}\n世界设定：${room.game?.setting}\n公开目标/局势：${room.game?.globalGoal}\n游戏模式：${gameModeLabel(playMode)}\n当前回合：${room.turnNumber}\n玩家权威状态（服务器记录，以此为准；包含真实角色/目标/物品/状态/空间，仅 GM 可见）：${JSON.stringify(playerSummary)}\n当前空间分组（同组才能自然听见说话/看见近处行动）：${JSON.stringify(locationGroups)}\n历史消息上下文（按估算 token 预算尽量纳入，越靠后越新；say 消息的 audienceUsernames 是实际听见的人）：${JSON.stringify(historyContext.messages)}\n历史消息纳入情况：${JSON.stringify({ totalMessages: historyContext.totalMessages, includedMessages: historyContext.includedMessages, omittedOlderMessages: historyContext.omittedOlderMessages, estimatedMessageTokens: historyContext.estimatedMessageTokens, messageTokenBudget: historyContext.messageTokenBudget, totalContextTokenBudget: historyContext.totalContextTokenBudget })}\n本回合行动（仅代表玩家尝试，不代表事实已成立；location 是提交行动时所在空间）：${JSON.stringify(actions)}\n超时未行动玩家：${JSON.stringify(timedOutUsers)}\n因死亡/体力耗尽/昏迷等无法行动玩家：${JSON.stringify(unableUsers)}\n\n服务器规则：\n- hp/生命值 <= 0 会死亡并无法行动。某些世界观可以复活；只要通过故事进展工具把 hp 调回 >0，就会从死亡中恢复。\n- stamina/体力 <= 0 会进入“力竭”并无法行动；但如果角色只是因体力耗尽倒下，且没有“受伤/重伤/流血/骨折/中毒/休克/昏迷”等伤病或无意识状态，应允许短暂喘息后的自然体力恢复。不要把单纯力竭写成永久昏迷或无法自然恢复；通常在 1 回合左右用 statsDelta 或 statsSet 把 stamina 恢复到至少 1，并移除“力竭”。\n- “休克”是用于重击、坠落、爆震、严重创伤、窒息等导致晕倒/意识中断的状态开关：需要时用 statusAdd:["休克"]（可配合 hp/stamina 变化）；休克/昏迷/晕倒会无法行动且无法感知，持续应比单纯力竭更久，通常需要同伴唤醒、急救、稳定体征或安全环境后才能用 statusRemove 移除。\n- 状态标签包含“休克/昏迷/晕倒/无意识/无法行动/瘫痪/石化/沉睡/眩晕/麻痹”等会无法行动；其中休克/昏迷/晕倒/沉睡/死亡还代表无法获取外界信息。\n- 物品栏、状态标签、属性数值、位置的真实改变，必须放在 storyProgressToolCalls 中；只在 narration/privateNarrations/stateChanges 里描述不会改变服务器状态。凡是播报里写“受伤、流血、中毒、昏迷、休克、死亡、力竭、恢复、获得/失去物品、移动/分散/汇合、消耗资源”等，都必须有对应 updateCharacter 工具调用；如果没有工具调用，就不要把它写成已发生事实。\n- 工具使用倾向：只要存在风险、不确定成败、对抗、搜索发现、躲避、说服、战斗、伤害、治疗、资源消耗、获得/丢失物品、状态改变或空间移动，就优先使用工具。概率/检定/风险事件先调用 roll_random；生命值、体力、额外属性、物品栏、状态标签和位置变化必须写入 storyProgressToolCalls。位置变化写在对应 updateCharacter.args.location（如 {"id":"archive","label":"档案室"}）。\n\n请输出下一段 GM 播报。要求：\n- 汇总所有有效行动并给出后果；对越权编造事实的行动要纠正为“尝试”并按背景和客观事实裁定。\n- ${privateMode ? '必须为每一名玩家输出 privateNarrations；每段严格按该玩家视角写，只包含其所在空间可见/可听、自己已知、或通过明确通信手段获得的信息。对休克/昏迷/晕倒/沉睡/死亡等无感知角色，只能写意识中断、黑暗、断片体感或等待救助，不能让其听见、看见、推理或获取外界新信息。绝对不要泄露其他空间行动、秘密目标、隐藏身份、未听到的说话或未观察到的状态变化。narration 字段只能写 GM 内部摘要/公开安全摘要。' : '合作模式下 narration 是全队可见播报。'}\n- 如果有人超时或无法行动，用剧情方式轻微体现但不要羞辱。\n- 结尾给出清晰的新局势/可行动钩子，让仍可行动玩家下一回合都有事可做。\n- 主动、频繁地使用 storyProgressToolCalls 调整角色的生命值、体力、额外属性、物品栏、状态标签和 location。常见行动可消耗 stamina，受伤扣 hp 并添加伤势状态，获得/丢失物品修改 inventory，移动/分散/汇合修改 location；不要让这些变化只停留在 narration/privateNarrations/stateChanges。\n${mvpRequirement}\n- 可以让危险升级，但不要突然结束，除非剧情自然达成目标。\n- 中文，生动但精炼。\n\n最终返回 JSON：\n{\n  "narration": "合作模式的全队播报；独立/PVP 可写公开安全摘要，不要含秘密",${privateOutputSchema}\n  "stateChanges": "状态变化摘要",\n  "storyProgressToolCalls": [\n    {\n      "tool":"updateCharacter",\n      "args":{\n        "username":"玩家名",\n        "reason":"为什么这样修改",\n        "statsDelta":{"hp":-2,"stamina":-1,"mana":-1},\n        "statsSet":{"hunger":{"label":"饱食度","value":3,"max":6}},\n        "inventoryAdd":["新物品"],\n        "inventoryRemove":["消耗或丢失的物品"],\n        "statusAdd":["受伤"],\n        "statusRemove":["力竭"],\n        "location":{"id":"new-space", "label":"新空间/地点名"}\n      }\n    }\n  ],\n  "spotlight": {"username":"可选被聚焦玩家", "text":"可选聚焦内容"} 或 null,\n  "gameOver": false,\n  "ending": "如果 gameOver 为 true，填写结局；否则空字符串",\n  "mvp": {"username":"独立模式 gameOver=true 时填写 MVP 玩家名", "reason":"评选理由"} 或 null\n}`,
     },
   ];
 

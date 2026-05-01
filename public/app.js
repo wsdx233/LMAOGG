@@ -133,7 +133,6 @@ const dom = {
   emojiPickerFallback: $('emojiPickerFallback'),
   sendChatButton: $('sendChatButton'),
   askGmButton: $('askGmButton'),
-  withdrawActionButton: $('withdrawActionButton'),
   submitActionButton: $('submitActionButton'),
   dossierContent: $('dossierContent'),
 };
@@ -890,17 +889,18 @@ function updateComposer(room) {
 
   dom.sendChatButton.textContent = privateMode ? '说话' : '发送聊天';
   dom.askGmButton.textContent = '询问';
-  dom.withdrawActionButton.textContent = '撤回行动';
-  dom.withdrawActionButton.classList.toggle('hidden', !canWithdraw);
-  dom.withdrawActionButton.disabled = !canWithdraw;
-  dom.submitActionButton.textContent = submitted ? '已提交' : (privateMode ? '行动' : '提交行动');
+  dom.submitActionButton.textContent = submitted ? (canWithdraw ? '撤销行动' : '已提交') : (privateMode ? '行动' : '提交行动');
+  dom.submitActionButton.classList.toggle('danger-btn', submitted && canWithdraw);
+  dom.submitActionButton.classList.toggle('primary-btn', !(submitted && canWithdraw));
   dom.progressTrack.classList.toggle('hidden', !inPlayingTurn);
   dom.progressTrack.classList.toggle('resolving', isResolving);
   dom.progressTrack.classList.toggle('paused', isPaused);
   dom.progressTrack.classList.toggle('error', Boolean(turn?.llmError));
   const blocksPrivateSpeech = room.status === 'playing' && privateMode && !viewerCanPerceive;
   const composerDisabled = room.status === 'starting' || blocksPrivateSpeech;
-  dom.submitActionButton.disabled = !(inPlayingTurn && !isResolving && (!isPaused || canSubmitDuringNoResponsePause) && !submitted && viewerCanAct);
+  dom.submitActionButton.disabled = submitted
+    ? !canWithdraw
+    : !(inPlayingTurn && !isResolving && (!isPaused || canSubmitDuringNoResponsePause) && viewerCanAct);
   dom.askGmButton.disabled = state.gmInquiryPending || composerDisabled || !canAskGm;
   dom.sendChatButton.disabled = composerDisabled;
   dom.composerInput.disabled = composerDisabled;
@@ -1162,7 +1162,7 @@ async function withdrawAction() {
     .find((message) => message.type === 'action' && message.userId === state.me?.id && Number(message.turn) === turnNumber)
     ?.text || '';
 
-  dom.withdrawActionButton.disabled = true;
+  dom.submitActionButton.disabled = true;
   try {
     const response = await emitAck('turn:withdraw', { roomId: state.currentRoom.id });
     if (response.room) {
@@ -1175,11 +1175,16 @@ async function withdrawAction() {
   } catch (error) {
     showToast(error.message, 'error');
   } finally {
-    dom.withdrawActionButton.disabled = false;
+    dom.submitActionButton.disabled = false;
   }
 }
 
 async function submitAction() {
+  const turn = state.currentRoom?.currentTurn;
+  if (turn?.viewerSubmitted) {
+    if (turn.viewerCanWithdraw) return withdrawAction();
+    return showToast('行动已提交，当前无法撤回。', 'error');
+  }
   const text = dom.composerInput.value.trim();
   if (!text) return showToast('先写下你的行动。', 'error');
   try {
@@ -1283,7 +1288,6 @@ function bindEvents() {
     insertEmojiIntoComposer(emoji);
     closeEmojiPicker();
   });
-  dom.withdrawActionButton.addEventListener('click', withdrawAction);
   dom.askGmButton.addEventListener('click', askGm);
   dom.submitActionButton.addEventListener('click', submitAction);
   dom.sendChatButton.addEventListener('click', sendChat);

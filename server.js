@@ -26,6 +26,10 @@ const BOT_CHAT_RESPONSE_DELAY_MS = 700;
 const MAX_TURN_INQUIRIES_PER_PLAYER = 3;
 const MAX_BOT_TURN_DECISION_STEPS = 4;
 const BOT_TURN_DECISION_DELAY_MS = 450;
+const BOT_WAIT_DEFAULT_MS = 8000;
+const BOT_WAIT_MIN_MS = 1000;
+const BOT_WAIT_MAX_MS = 30000;
+const BOT_WAIT_WAKE_CHAT_SUPPRESS_MS = 2500;
 const ROOMS_FILE = path.resolve('data', 'rooms.json');
 const USERNAME_RE = /^[\p{L}\p{N}_-]{3,20}$/u;
 const DEFAULT_STATS = {
@@ -1111,6 +1115,8 @@ function rehydrateTurn(rawTurn, room) {
     eligibleUserIds,
     actions,
     inquiries,
+    botDecisionSteps: new Map(),
+    botWaits: new Map(),
     resolving: false,
     paused: Boolean(shouldPause || rawTurn.llmError),
     pauseKind: normalizeStateText(rawTurn.pauseKind || (shouldPause ? 'missing' : ''), 32),
@@ -1209,6 +1215,181 @@ function emitRoom(room) {
 function clearRoomTimer(room) {
   if (room?.currentTurn?.timer) clearTimeout(room.currentTurn.timer);
   if (room?.currentTurn) room.currentTurn.timer = null;
+  clearBotWaitTimers(room?.currentTurn);
+}
+
+function clearBotWaitTimers(turn) {
+  if (!turn?.botWaits) return;
+  const waits = turn.botWaits instanceof Map ? [...turn.botWaits.values()] : Object.values(turn.botWaits || {});
+  for (const wait of waits) {
+    if (wait?.timer) clearTimeout(wait.timer);
+  }
+  if (turn.botWaits instanceof Map) turn.botWaits.clear();
+}
+
+function ensureBotTurnRuntime(turn) {
+  if (!turn) return;
+  if (!(turn.botDecisionSteps instanceof Map)) turn.botDecisionSteps = new Map();
+  if (!(turn.botWaits instanceof Map)) turn.botWaits = new Map();
+}
+
+function botDecisionStep(turn, botId) {
+  ensureBotTurnRuntime(turn);
+  return clampNumber(turn?.botDecisionSteps?.get(botId), 0, 0, MAX_BOT_TURN_DECISION_STEPS);
+}
+
+function nextBotDecisionStep(turn, botId) {
+  ensureBotTurnRuntime(turn);
+  const next = botDecisionStep(turn, botId) + 1;
+  turn.botDecisionSteps.set(botId, next);
+  return next;
+}
+
+function clearBotWait(turn, botId) {
+  ensureBotTurnRuntime(turn);
+  const wait = turn?.botWaits?.get(botId);
+  if (wait?.timer) clearTimeout(wait.timer);
+  turn?.botWaits?.delete(botId);
+}
+
+function resetBotDecisionState(turn, botId) {
+  if (!turn) return;
+  clearBotWait(turn, botId);
+  ensureBotTurnRuntime(turn);
+  turn.botDecisionSteps.delete(botId);
+}
+
+function isBotWaiting(turn, botId) {
+  ensureBotTurnRuntime(turn);
+  return Boolean(turn?.botWaits?.has(botId));
+}
+
+function normalizeBotWaitUntilType(input) {
+  const raw = normalizeStateText(input || 'activity', 40).toLowerCase().replace(/[\s_]+/g, '-');
+  if (['time', 'timeout', 'duration', 'fixed', 'fixed-time', 'sleep'].includes(raw)) return 'time';
+  if (['message', 'any-message', 'chat', 'say', 'speak', 'speech', 'talk'].includes(raw)) return 'message';
+  if (['human-message', 'player-message', 'player-speak', 'human-speak'].includes(raw)) return 'human-message';
+  if (['bot-message', 'llm-message', 'llm-bot-message', 'bot-speak'].includes(raw)) return 'bot-message';
+  if (['action', 'any-action', 'submit', 'submission', 'turn-action'].includes(raw)) return 'action';
+  if (['human-action', 'player-action'].includes(raw)) return 'human-action';
+  if (['bot-action', 'llm-action', 'llm-bot-action'].includes(raw)) return 'bot-action';
+  return 'activity';
+}
+
+function normalizeBotWaitRequest(decision = {}) {
+  const untilInput = decision.waitUntil || decision.until || {};
+  const untilType = typeof untilInput === 'string'
+    ? untilInput
+    : untilInput?.type || untilInput?.event || untilInput?.kind || untilInput?.mode || 'activity';
+  const username = normalizeStateText(
+    (typeof untilInput === 'object' && untilInput ? untilInput.username || untilInput.player || untilInput.bot || untilInput.target : '')
+      || decision.waitFor || decision.username || '',
+    80
+  );
+  const rawMs = decision.waitMs
+    ?? decision.durationMs
+    ?? decision.timeoutMs
+    ?? decision.milliseconds
+    ?? (decision.seconds !== undefined ? Number(decision.seconds) * 1000 : undefined);
+  return {
+    waitMs: clampNumber(rawMs, BOT_WAIT_DEFAULT_MS, BOT_WAIT_MIN_MS, BOT_WAIT_MAX_MS),
+    until: normalizeBotWaitUntilType(untilType),
+    username,
+    reason: normalizeStateText(decision.reason, 140),
+  };
+}
+
+function botWaitEventMatches(wait, event) {
+  if (!wait || !event || event.userId === wait.botId) return false;
+  if (event.kind === 'message' && Array.isArray(event.audienceIds) && event.audienceIds.length && !event.audienceIds.includes(wait.botId)) return false;
+  if (wait.username && String(event.username || '').toLowerCase() !== wait.username.toLowerCase()) return false;
+  if (wait.until === 'time') return false;
+  if (wait.until === 'message') return event.kind === 'message';
+  if (wait.until === 'human-message') return event.kind === 'message' && !event.isBot;
+  if (wait.until === 'bot-message') return event.kind === 'message' && event.isBot;
+  if (wait.until === 'action') return event.kind === 'action';
+  if (wait.until === 'human-action') return event.kind === 'action' && !event.isBot;
+  if (wait.until === 'bot-action') return event.kind === 'action' && event.isBot;
+  return ['message', 'action'].includes(event.kind);
+}
+
+function scheduleSubmitBotActions(roomId, delayMs = 0) {
+  setTimeout(() => {
+    submitBotActions(roomId).catch((error) => {
+      console.error('[bot] scheduled bot action submission failed:', error);
+    });
+  }, Math.max(0, Number(delayMs) || 0));
+}
+
+function wakeWaitingBotsForEvent(room, event) {
+  const turn = room?.currentTurn;
+  if (!room || room.status !== 'playing' || !turn || turn.resolving || turn.paused || turn.llmError) return 0;
+  ensureBotTurnRuntime(turn);
+  const waits = [...turn.botWaits.entries()];
+  let woke = 0;
+  for (const [botId, wait] of waits) {
+    if (!botWaitEventMatches(wait, event)) continue;
+    const bot = room.players.get(botId);
+    if (bot) bot.lastBotWaitWakeAt = Date.now();
+    clearBotWait(turn, botId);
+    woke += 1;
+  }
+  if (woke) scheduleSubmitBotActions(room.id, 0);
+  return woke;
+}
+
+function notifyBotWaitsForMessage(room, message) {
+  if (!room || !isChatMessageType(message)) return;
+  wakeWaitingBotsForEvent(room, {
+    kind: 'message',
+    userId: message.userId || '',
+    username: message.username || '',
+    isBot: Boolean(message.isBot || isBotId(message.userId)),
+    audienceIds: Array.isArray(message.recipients) ? message.recipients : [],
+  });
+}
+
+function notifyBotWaitsForAction(room, player) {
+  if (!room || !player) return;
+  wakeWaitingBotsForEvent(room, {
+    kind: 'action',
+    userId: player.id,
+    username: player.username,
+    isBot: Boolean(player.isBot),
+  });
+}
+
+function setBotWait(roomId, room, turn, bot, decision) {
+  if (!botTurnStillActive(roomId, room, turn, bot)) return null;
+  const waitRequest = normalizeBotWaitRequest(decision);
+  clearBotWait(turn, bot.id);
+  const wait = {
+    ...waitRequest,
+    botId: bot.id,
+    createdAt: Date.now(),
+    deadline: Date.now() + waitRequest.waitMs,
+    timer: null,
+  };
+  wait.timer = setTimeout(() => {
+    const currentRoom = rooms.get(roomId);
+    const currentTurn = currentRoom?.currentTurn;
+    if (!currentRoom || currentTurn !== turn) return;
+    ensureBotTurnRuntime(currentTurn);
+    if (currentTurn.botWaits.get(bot.id) !== wait) return;
+    clearBotWait(currentTurn, bot.id);
+    scheduleSubmitBotActions(roomId, 0);
+  }, waitRequest.waitMs);
+  ensureBotTurnRuntime(turn);
+  turn.botWaits.set(bot.id, wait);
+  return wait;
+}
+
+function hasReadyPendingBots(room, turn = room?.currentTurn) {
+  if (!room || !turn) return false;
+  ensureBotTurnRuntime(turn);
+  return (turn.eligibleUserIds || [])
+    .map((id) => room.players.get(id))
+    .some((player) => player?.isBot && canPlayerAct(player) && !turn.actions.has(player.id) && !isBotWaiting(turn, player.id));
 }
 
 function pauseTurnIfNeeded(room, reason = '等待玩家返回') {
@@ -1436,7 +1617,7 @@ function eligibleBotChatResponders(room, triggerMessage) {
   const attempted = new Set(Array.isArray(triggerMessage.botChatAttemptedResponderIds) ? triggerMessage.botChatAttemptedResponderIds : []);
   const now = Date.now();
   const candidates = [...room.players.values()].filter((player) => {
-    if (!player.isBot || player.proactiveStopped || attempted.has(player.id) || !botCanHearChatMessage(room, player, triggerMessage)) return false;
+    if (!player.isBot || player.proactiveStopped || attempted.has(player.id) || isBotWaiting(room.currentTurn, player.id) || now - Number(player.lastBotWaitWakeAt || 0) < BOT_WAIT_WAKE_CHAT_SUPPRESS_MS || !botCanHearChatMessage(room, player, triggerMessage)) return false;
     if (botMentionedInText(player, triggerMessage.text)) return true;
     return now - Number(player.lastBotChatAt || 0) >= BOT_CHAT_COOLDOWN_MS;
   });
@@ -1451,10 +1632,11 @@ function appendBotChatMessage(room, bot, text, triggerMessage) {
   const depth = botChatDepth(triggerMessage) + 1;
   const threadId = triggerMessage?.botChatThreadId || triggerMessage?.id || crypto.randomUUID();
 
+  let message;
   if (privateMode) {
     const recipients = audibleUserIds(room, bot.id, { respectPerception: room.status === 'playing' });
     const audienceNames = recipients.map((id) => room.players.get(id)?.username).filter(Boolean);
-    return appendMessage(room, 'say', text, {
+    message = appendMessage(room, 'say', text, {
       userId: bot.id,
       username: bot.username,
       isBot: true,
@@ -1465,16 +1647,18 @@ function appendBotChatMessage(room, bot, text, triggerMessage) {
       botChatTriggerId: triggerMessage?.id || '',
       botChatThreadId: threadId,
     });
+  } else {
+    message = appendMessage(room, 'chat', text, {
+      userId: bot.id,
+      username: bot.username,
+      isBot: true,
+      botChatDepth: depth,
+      botChatTriggerId: triggerMessage?.id || '',
+      botChatThreadId: threadId,
+    });
   }
-
-  return appendMessage(room, 'chat', text, {
-    userId: bot.id,
-    username: bot.username,
-    isBot: true,
-    botChatDepth: depth,
-    botChatTriggerId: triggerMessage?.id || '',
-    botChatThreadId: threadId,
-  });
+  notifyBotWaitsForMessage(room, message);
+  return message;
 }
 
 function submitBotActionRecord(room, turn, bot, text, { passive = false } = {}) {
@@ -1493,6 +1677,8 @@ function submitBotActionRecord(room, turn, bot, text, { passive = false } = {}) 
     recipients: privateAction ? [bot.id] : undefined,
   });
   actionRecord.messageId = actionMessage.id;
+  clearBotWait(turn, bot.id);
+  notifyBotWaitsForAction(room, bot);
   return actionRecord;
 }
 
@@ -1548,6 +1734,7 @@ function withdrawBotActionForRevision(room, bot, triggerMessage) {
   const actionRecord = turn.actions.get(bot.id);
   turn.actions.delete(bot.id);
   removeSubmittedActionMessage(room, bot.id, turn, actionRecord);
+  resetBotDecisionState(turn, bot.id);
   return true;
 }
 
@@ -2057,6 +2244,9 @@ function beginTurn(room) {
       deadline: startedAt + timeoutMs,
       eligibleUserIds: [],
       actions: new Map(),
+      inquiries: new Map(),
+      botDecisionSteps: new Map(),
+      botWaits: new Map(),
       resolving: false,
       paused: true,
       pauseKind: 'no-able-players',
@@ -2079,6 +2269,8 @@ function beginTurn(room) {
     eligibleUserIds,
     actions: new Map(),
     inquiries: new Map(),
+    botDecisionSteps: new Map(),
+    botWaits: new Map(),
     resolving: false,
     paused: shouldPause,
     pauseKind: shouldPause ? (hasEligibleHuman ? (hasPresentHumanPlayer(room) ? 'missing' : 'no-human') : 'bot-only') : '',
@@ -2119,19 +2311,22 @@ function botTurnStillActive(roomId, room, turn, bot) {
     && !turn.resolving
     && !turn.paused
     && !turn.actions.has(bot.id)
+    && !isBotWaiting(turn, bot.id)
     && room.players.has(bot.id)
     && canPlayerAct(room.players.get(bot.id));
 }
 
 async function runBotTurnDecisions(roomId, room, turn, bot) {
+  ensureBotTurnRuntime(turn);
   if (bot.proactiveStopped) {
     submitBotActionRecord(room, turn, bot, `${bot.username}保持观察，等待队伍指示。`, { passive: true });
     emitRoom(room);
     return;
   }
 
-  for (let step = 1; step <= MAX_BOT_TURN_DECISION_STEPS; step += 1) {
+  while (botDecisionStep(turn, bot.id) < MAX_BOT_TURN_DECISION_STEPS) {
     if (!botTurnStillActive(roomId, room, turn, bot)) return;
+    const step = nextBotDecisionStep(turn, bot.id);
     const recentMessages = (isPrivateInfoMode(room) ? room.messages.filter((message) => messageVisibleToViewer(message, bot.id)) : room.messages)
       .map((message) => llmMessageContext(room, message));
     const inquiryRemaining = Math.max(0, MAX_TURN_INQUIRIES_PER_PLAYER - turnInquiryCount(turn, bot.id));
@@ -2152,8 +2347,9 @@ async function runBotTurnDecisions(roomId, room, turn, bot) {
     if (kind === 'say') {
       if (text) {
         bot.lastBotChatAt = Date.now();
-        appendBotChatMessage(room, bot, text, null);
+        const message = appendBotChatMessage(room, bot, text, null);
         emitRoom(room);
+        if (message?.id) scheduleBotChatResponses(room.id, message.id);
       }
       await sleep(BOT_TURN_DECISION_DELAY_MS);
       continue;
@@ -2170,6 +2366,12 @@ async function runBotTurnDecisions(roomId, room, turn, bot) {
         }
       }
       await sleep(BOT_TURN_DECISION_DELAY_MS);
+      continue;
+    }
+
+    if (kind === 'wait') {
+      const wait = setBotWait(roomId, room, turn, bot, decision);
+      if (wait) return;
       continue;
     }
 
@@ -2206,13 +2408,13 @@ async function submitBotActions(roomId) {
 
   const bots = (turn.eligibleUserIds || [])
     .map((id) => room.players.get(id))
-    .filter((player) => player?.isBot && canPlayerAct(player) && !turn.actions.has(player.id));
+    .filter((player) => player?.isBot && canPlayerAct(player) && !turn.actions.has(player.id) && !isBotWaiting(turn, player.id));
   if (!bots.length) return;
 
   turn.botSubmitting = true;
   try {
     for (const bot of bots) {
-      if (!botTurnStillActive(roomId, room, turn, bot)) break;
+      if (!botTurnStillActive(roomId, room, turn, bot)) continue;
       await runBotTurnDecisions(roomId, room, turn, bot);
     }
   } finally {
@@ -2220,6 +2422,10 @@ async function submitBotActions(roomId) {
   }
 
   if (!rooms.has(roomId) || room.currentTurn !== turn || turn.resolving || turn.paused) return;
+  if (hasReadyPendingBots(room, turn)) {
+    scheduleSubmitBotActions(room.id, 0);
+    return;
+  }
   const eligible = (turn.eligibleUserIds || []).filter((id) => room.players.has(id) && canPlayerAct(room.players.get(id)));
   const allSubmitted = eligible.length > 0 && eligible.every((id) => turn.actions.has(id));
   if (allSubmitted) resolveTurn(room.id, 'all-submitted');
@@ -2485,6 +2691,7 @@ io.on('connection', (socket) => {
         recipients: privateAction ? [user.id] : undefined,
       });
       actionRecord.messageId = actionMessage.id;
+      notifyBotWaitsForAction(room, player);
       emitRoom(room);
       ackOk(ack);
       if (canSubmitDuringNoResponsePause) resumeNoResponseTurnAfterAction(room, `${user.username} 已提交行动`);
@@ -2538,6 +2745,7 @@ io.on('connection', (socket) => {
           botChatThreadId: crypto.randomUUID(),
         });
       }
+      notifyBotWaitsForMessage(room, message);
       emitRoom(room);
       ackOk(ack);
       scheduleBotChatResponses(room.id, message.id);
