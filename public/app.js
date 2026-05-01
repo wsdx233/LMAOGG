@@ -31,6 +31,7 @@ const state = {
   emojiPickerOpen: false,
   emojiPickerReady: false,
   emojiPickerLoading: null,
+  gmInquiryPending: false,
 };
 
 const STATUS_LABELS = {
@@ -131,6 +132,7 @@ const dom = {
   emojiPicker: $('emojiPicker'),
   emojiPickerFallback: $('emojiPickerFallback'),
   sendChatButton: $('sendChatButton'),
+  askGmButton: $('askGmButton'),
   withdrawActionButton: $('withdrawActionButton'),
   submitActionButton: $('submitActionButton'),
   dossierContent: $('dossierContent'),
@@ -788,7 +790,7 @@ function renderMessages(room) {
 
     const item = el('article', `message ${type}`);
     const author = type === 'gm' ? 'LLM GM' : type === 'system' ? '系统' : message.username || '玩家';
-    const label = type === 'action' ? '行动' : type === 'say' ? '说话' : type === 'chat' ? '聊天' : type === 'gm' ? '播报' : '系统';
+    const label = type === 'action' ? '行动' : type === 'ask' ? '询问' : type === 'say' ? '说话' : type === 'chat' ? '聊天' : type === 'gm' ? (message.inquiryId ? '回答' : '播报') : '系统';
 
     if (type !== 'system') {
       item.append(el('div', 'message-avatar', initials(author)));
@@ -874,12 +876,20 @@ function updateComposer(room) {
   const canSubmitDuringNoResponsePause = Boolean(isPaused && turn?.pauseKind === 'no-response');
   const submitted = Boolean(turn?.viewerSubmitted);
   const canWithdraw = Boolean(turn?.viewerCanWithdraw);
+  const inquiryLimit = Number(turn?.viewerInquiryLimit || 3);
+  const inquiryCount = Number(turn?.viewerInquiryCount || 0);
+  const inquiryRemaining = Math.max(0, inquiryLimit - inquiryCount);
+  const canAskGm = Boolean(turn?.viewerCanAskGm && inquiryRemaining > 0);
   const viewer = room.players.find((player) => player.id === state.me?.id);
   const viewerCanAct = Boolean(turn?.viewerCanAct);
+  const inquiryCue = inPlayingTurn && viewerCanAct && !submitted
+    ? `(询问${inquiryRemaining}/${inquiryLimit})`
+    : '';
   const viewerCanPerceive = viewer?.condition?.canPerceive !== false;
   const privateMode = PRIVATE_INFO_MODES.has(room.playMode || room.game?.playMode);
 
   dom.sendChatButton.textContent = privateMode ? '说话' : '发送聊天';
+  dom.askGmButton.textContent = '询问';
   dom.withdrawActionButton.textContent = '撤回行动';
   dom.withdrawActionButton.classList.toggle('hidden', !canWithdraw);
   dom.withdrawActionButton.disabled = !canWithdraw;
@@ -891,6 +901,7 @@ function updateComposer(room) {
   const blocksPrivateSpeech = room.status === 'playing' && privateMode && !viewerCanPerceive;
   const composerDisabled = room.status === 'starting' || blocksPrivateSpeech;
   dom.submitActionButton.disabled = !(inPlayingTurn && !isResolving && (!isPaused || canSubmitDuringNoResponsePause) && !submitted && viewerCanAct);
+  dom.askGmButton.disabled = state.gmInquiryPending || composerDisabled || !canAskGm;
   dom.sendChatButton.disabled = composerDisabled;
   dom.composerInput.disabled = composerDisabled;
   dom.emojiPickerButton.disabled = composerDisabled;
@@ -923,8 +934,8 @@ function updateComposer(room) {
   } else if (isPaused) {
     dom.turnClock.textContent = '暂停';
     if (turn.pauseKind === 'no-response') {
-      dom.turnHint.textContent = '本回合没有真人玩家提交行动，已强制暂停避免空转；输入行动并提交即可继续倒计时。';
-      dom.composerInput.placeholder = privateMode ? '写下你的私下行动来继续本回合；说话仍只传给同空间角色。' : '写下你的行动来继续本回合。';
+      dom.turnHint.textContent = `本回合没有真人玩家提交行动，已强制暂停避免空转；输入行动并提交即可继续倒计时${inquiryCue}。`;
+      dom.composerInput.placeholder = privateMode ? '可先询问 GM、说话，或写下你的私下行动来继续本回合。' : '可先询问 GM，或写下你的行动来继续本回合。';
     } else if (turn.pauseKind === 'bot-only') {
       dom.turnHint.textContent = '回合已暂停：当前可行动角色里没有真人玩家，避免只由 LLM Bot 自动推进。';
       dom.composerInput.placeholder = privateMode ? '可说话复盘；需要真人角色恢复可行动或由房主中止/重开。' : '可聊天复盘；需要真人角色恢复可行动或由房主中止/重开。';
@@ -948,12 +959,10 @@ function updateComposer(room) {
       : `你已提交行动。等待 ${pending} 名玩家，或倒计时结束。`;
     dom.composerInput.placeholder = privateMode ? '已提交行动；也可以说话，只有同空间角色能听见。' : '已提交行动；也可以发送聊天。';
   } else if (turn) {
-    dom.turnHint.textContent = privateMode
-      ? `第 ${turn.turn} 回合：请开始行动。`
-      : `第 ${turn.turn} 回合：请开始行动。`;
+    dom.turnHint.textContent = `第 ${turn.turn} 回合：请开始行动${inquiryCue}。`;
     dom.composerInput.placeholder = privateMode
-      ? '输入你要说的话或私下行动'
-      : '输入本回合行动';
+      ? '输入你要说的话、询问 GM，或私下行动'
+      : '输入本回合行动，或先询问 GM';
   }
 
   updateProgress();
@@ -1192,6 +1201,24 @@ async function sendChat() {
   }
 }
 
+async function askGm() {
+  const text = dom.composerInput.value.trim();
+  if (!text) return showToast('先输入想询问 GM 的问题。', 'error');
+  if (state.gmInquiryPending) return;
+  state.gmInquiryPending = true;
+  dom.askGmButton.disabled = true;
+  dom.askGmButton.textContent = '询问';
+  try {
+    await emitAck('gm:ask', { roomId: state.currentRoom?.id, question: text }, 140000);
+    dom.composerInput.value = '';
+  } catch (error) {
+    showToast(error.message, 'error');
+  } finally {
+    state.gmInquiryPending = false;
+    if (state.currentRoom && state.view === 'game') renderGame();
+  }
+}
+
 function bindEvents() {
   renderQuickEmojiList();
   dom.loginTab.addEventListener('click', () => setAuthMode('login'));
@@ -1257,6 +1284,7 @@ function bindEvents() {
     closeEmojiPicker();
   });
   dom.withdrawActionButton.addEventListener('click', withdrawAction);
+  dom.askGmButton.addEventListener('click', askGm);
   dom.submitActionButton.addEventListener('click', submitAction);
   dom.sendChatButton.addEventListener('click', sendChat);
   dom.composerInput.addEventListener('keydown', (event) => {

@@ -11,7 +11,7 @@ import bcrypt from 'bcryptjs';
 import { Server } from 'socket.io';
 
 import { createUser, findUserById, findUserByUsername } from './src/store.js';
-import { generateBotAction, generateBotChatReply, generateGameSetup, generateTurnNarration, getTurnTimeoutMs } from './src/llm.js';
+import { generateBotAction, generateBotChatReply, generateGameSetup, generateGmInquiryReply, generateTurnNarration, getTurnTimeoutMs } from './src/llm.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
@@ -23,6 +23,7 @@ const MAX_BOT_CHAT_RESPONSES_PER_MESSAGE = 2;
 const MAX_BOT_CHAT_CHAIN_DEPTH = 2;
 const BOT_CHAT_COOLDOWN_MS = 12000;
 const BOT_CHAT_RESPONSE_DELAY_MS = 700;
+const MAX_TURN_INQUIRIES_PER_PLAYER = 3;
 const ROOMS_FILE = path.resolve('data', 'rooms.json');
 const USERNAME_RE = /^[\p{L}\p{N}_-]{3,20}$/u;
 const DEFAULT_STATS = {
@@ -799,6 +800,29 @@ function canWithdrawTurnAction(room, userId) {
   return pendingOtherEligibleUserIds(room, userId, turn).length > 0;
 }
 
+function turnInquiryCount(turn, userId) {
+  if (!turn?.inquiries) return 0;
+  if (turn.inquiries instanceof Map) return Number(turn.inquiries.get(userId) || 0);
+  if (typeof turn.inquiries === 'object') return Number(turn.inquiries[userId] || 0);
+  return 0;
+}
+
+function setTurnInquiryCount(turn, userId, count) {
+  if (!turn) return;
+  if (!(turn.inquiries instanceof Map)) turn.inquiries = new Map(Object.entries(turn.inquiries || {}));
+  turn.inquiries.set(userId, Math.max(0, Number(count) || 0));
+}
+
+function canAskGmThisTurn(room, userId) {
+  const turn = room?.currentTurn;
+  if (!room || room.status !== 'playing' || !turn || turn.resolving || turn.llmError) return false;
+  if (turn.actions?.has(userId)) return false;
+  const player = room.players.get(userId);
+  if (!player || player.isBot || !canPlayerAct(player) || !canPlayerPerceive(player)) return false;
+  if (!(turn.eligibleUserIds || activeUserIds(room)).includes(userId)) return false;
+  return turnInquiryCount(turn, userId) < MAX_TURN_INQUIRIES_PER_PLAYER;
+}
+
 function removeSubmittedActionMessage(room, userId, turn, actionRecord) {
   const messages = room.messages || [];
   const messageId = actionRecord?.messageId || '';
@@ -897,6 +921,9 @@ function serializeRoom(room, viewerId) {
           : [...room.players.keys()].filter((id) => !eligibleUserIds.includes(id)),
         viewerSubmitted: room.currentTurn.actions.has(viewerId),
         viewerCanWithdraw: canWithdrawTurnAction(room, viewerId),
+        viewerInquiryCount: turnInquiryCount(room.currentTurn, viewerId),
+        viewerInquiryLimit: MAX_TURN_INQUIRIES_PER_PLAYER,
+        viewerCanAskGm: canAskGmThisTurn(room, viewerId),
         viewerCanAct: eligibleUserIds.includes(viewerId),
       }
     : null;
@@ -986,6 +1013,7 @@ function serializeTurnForPersistence(turn) {
     totalMs,
     eligibleUserIds: Array.isArray(turn.eligibleUserIds) ? turn.eligibleUserIds : [],
     actions: [...(turn.actions || new Map()).entries()],
+    inquiries: [...(turn.inquiries || new Map()).entries()],
   };
 }
 
@@ -1058,6 +1086,7 @@ function readPersistedRooms() {
 function rehydrateTurn(rawTurn, room) {
   if (!rawTurn || room.status !== 'playing') return null;
   const actions = new Map(Array.isArray(rawTurn.actions) ? rawTurn.actions : []);
+  const inquiries = new Map(Array.isArray(rawTurn.inquiries) ? rawTurn.inquiries : []);
   const eligibleUserIds = Array.isArray(rawTurn.eligibleUserIds) && rawTurn.eligibleUserIds.length
     ? rawTurn.eligibleUserIds.filter((id) => room.players.has(id) && canPlayerAct(room.players.get(id)))
     : activeUserIds(room);
@@ -1073,6 +1102,7 @@ function rehydrateTurn(rawTurn, room) {
     deadline: shouldPause ? now + remainingMs : now + remainingMs,
     eligibleUserIds,
     actions,
+    inquiries,
     resolving: false,
     paused: Boolean(shouldPause || rawTurn.llmError),
     pauseKind: normalizeStateText(rawTurn.pauseKind || (shouldPause ? 'missing' : ''), 32),
@@ -1294,6 +1324,76 @@ function withdrawTurnAction(roomId, user) {
 
   emitRoom(room);
   return room;
+}
+
+async function askGmForInformation(roomId, user, rawQuestion) {
+  const room = rooms.get(roomId);
+  if (!room || !room.players.has(user.id)) throw new Error('你不在这个房间中。');
+  if (room.status === 'starting') throw new Error('LLM 正在生成中，请稍后再询问 GM。');
+  if (!room.game) throw new Error('开局后才能向 GM 询问信息。');
+  if (room.status !== 'playing' || !room.currentTurn) throw new Error('只能在每轮行动前向 GM 询问信息。');
+  const turn = room.currentTurn;
+  if (turn.resolving) throw new Error('本回合正在结算中，无法继续询问 GM。');
+  if (turn.llmError) throw new Error('LLM 调用失败，当前回合已暂停，等待房主手动重试。');
+
+  const player = room.players.get(user.id);
+  const condition = getPlayerCondition(player);
+  if (turn.actions.has(user.id)) throw new Error('你已提交本回合行动，不能再进行行动前询问。');
+  if (!turn.eligibleUserIds?.includes(user.id) || !condition.canAct) throw new Error(`你当前${condition.label}，无法进行行动前询问。`);
+  if (!condition.canPerceive) throw new Error(`你当前${condition.label}，无法获取外界信息。`);
+
+  const inquiryCount = turnInquiryCount(turn, user.id);
+  if (inquiryCount >= MAX_TURN_INQUIRIES_PER_PLAYER) throw new Error(`本回合行动前最多只能询问 GM ${MAX_TURN_INQUIRIES_PER_PLAYER} 次。`);
+
+  const question = normalizeStateText(rawQuestion, 700);
+  if (!question) throw new Error('请先输入想询问 GM 的问题。');
+  setTurnInquiryCount(turn, user.id, inquiryCount + 1);
+
+  const privateAnswer = isPrivateInfoMode(room);
+  const recipients = privateAnswer ? [user.id] : undefined;
+  const location = normalizeLocation(player.location);
+  const askMessage = appendMessage(room, 'ask', question, {
+    userId: user.id,
+    username: user.username,
+    turn: room.turnNumber || 0,
+    location,
+    recipients,
+    privateTo: privateAnswer ? user.username : '',
+    visibilityLabel: privateAnswer ? '仅你与 GM 可见' : '询问 GM',
+  });
+  emitRoom(room);
+
+  const recentMessages = (privateAnswer ? room.messages.filter((message) => messageVisibleToViewer(message, user.id)) : room.messages)
+    .map((message) => llmMessageContext(room, message));
+
+  let answer = '';
+  try {
+    answer = normalizeStateText(await generateGmInquiryReply({ room, player, question, recentMessages }), 1200);
+  } catch (error) {
+    const currentRoom = rooms.get(roomId);
+    if (currentRoom === room && currentRoom.currentTurn === turn && currentRoom.players.has(user.id)) {
+      appendMessage(currentRoom, 'system', `GM 暂时无法回答该询问：${errorMessage(error)}。`, {
+        recipients,
+        privateTo: privateAnswer ? user.username : '',
+        visibilityLabel: privateAnswer ? '仅你可见' : '',
+      });
+      emitRoom(currentRoom);
+    }
+    throw error;
+  }
+
+  const currentRoom = rooms.get(roomId);
+  if (!currentRoom || currentRoom !== room || currentRoom.currentTurn !== turn || !currentRoom.players.has(user.id)) return room;
+  appendMessage(currentRoom, 'gm', answer || 'GM 暂时没有更多可透露的信息。', {
+    username: 'LLM GM',
+    turn: currentRoom.turnNumber || 0,
+    inquiryId: askMessage.id,
+    recipients,
+    privateTo: privateAnswer ? user.username : '',
+    visibilityLabel: privateAnswer ? 'GM 私下回答' : 'GM 回答',
+  });
+  emitRoom(currentRoom);
+  return currentRoom;
 }
 
 function isChatMessageType(message) {
@@ -1841,6 +1941,7 @@ function beginTurn(room) {
     deadline: startedAt + timeoutMs,
     eligibleUserIds,
     actions: new Map(),
+    inquiries: new Map(),
     resolving: false,
     paused: shouldPause,
     pauseKind: shouldPause ? (hasEligibleHuman ? (hasPresentHumanPlayer(room) ? 'missing' : 'no-human') : 'bot-only') : '',
@@ -2195,6 +2296,16 @@ io.on('connection', (socket) => {
       const activePlayerIds = (room.currentTurn.eligibleUserIds || []).filter((id) => room.players.has(id));
       const allSubmitted = activePlayerIds.length > 0 && activePlayerIds.every((id) => room.currentTurn.actions.has(id));
       if (allSubmitted) resolveTurn(room.id, 'all-submitted');
+    } catch (error) {
+      ackError(ack, error);
+    }
+  });
+
+  socket.on('gm:ask', async (payload, ack) => {
+    try {
+      const roomIdToAsk = String(payload?.roomId || userRooms.get(user.id) || '').toUpperCase();
+      const room = await askGmForInformation(roomIdToAsk, user, payload?.question || payload?.text);
+      ackOk(ack, { room: serializeRoom(room, user.id) });
     } catch (error) {
       ackError(ack, error);
     }

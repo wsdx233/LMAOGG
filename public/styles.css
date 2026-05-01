@@ -975,6 +975,31 @@ textarea:focus {
   background: #f7ffd6;
 }
 
+.message.ask .message-avatar {
+  background: var(--orange);
+}
+
+.message.ask .message-body {
+  background: #fff8cf;
+  border-style: dashed;
+}
+
+.message.ask .message-avatar::after {
+  content: "?";
+  position: absolute;
+  transform: translate(16px, 15px);
+  display: grid;
+  place-items: center;
+  width: 15px;
+  height: 15px;
+  border: 2px solid var(--ink);
+  border-radius: 999px;
+  background: var(--acid);
+  color: var(--ink);
+  font-size: 0.68rem;
+  line-height: 1;
+}
+
 .message.chat .message-avatar,
 .message.say .message-avatar {
   background: #ffffff;
@@ -993,6 +1018,7 @@ textarea:focus {
 }
 
 .message.action .message-body .visibility-chip,
+.message.ask .message-body .visibility-chip,
 .message.gm .message-body .visibility-chip,
 .message.say .message-body .visibility-chip {
   display: inline-flex;
@@ -1245,6 +1271,10 @@ textarea:focus {
 
 .composer-actions {
   justify-content: flex-end;
+}
+
+.ask-gm-button {
+  background: var(--sky);
 }
 
 .emoji-picker-shell {
