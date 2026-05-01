@@ -783,6 +783,52 @@ function submittedHumanUserIds(room, turn = room.currentTurn) {
   return [...turn.actions.keys()].filter((id) => room.players.has(id) && !room.players.get(id)?.isBot);
 }
 
+function pendingOtherEligibleUserIds(room, userId, turn = room.currentTurn) {
+  if (!turn?.actions) return [];
+  const eligibleUserIds = (turn.eligibleUserIds || activeUserIds(room))
+    .filter((id) => room.players.has(id) && canPlayerAct(room.players.get(id)));
+  return eligibleUserIds.filter((id) => id !== userId && !turn.actions.has(id));
+}
+
+function canWithdrawTurnAction(room, userId) {
+  const turn = room?.currentTurn;
+  if (!room || room.status !== 'playing' || !turn || !turn.actions?.has(userId)) return false;
+  if (turn.resolving || turn.llmError) return false;
+  const player = room.players.get(userId);
+  if (!player || player.isBot) return false;
+  return pendingOtherEligibleUserIds(room, userId, turn).length > 0;
+}
+
+function removeSubmittedActionMessage(room, userId, turn, actionRecord) {
+  const messages = room.messages || [];
+  const messageId = actionRecord?.messageId || '';
+  const actionId = actionRecord?.actionId || '';
+  let index = -1;
+
+  if (messageId || actionId) {
+    index = messages.findIndex((message) => (
+      (messageId && message.id === messageId)
+      || (actionId && message.actionId === actionId)
+    ));
+  }
+
+  if (index < 0) {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const message = messages[i];
+      if (message.type === 'action' && message.userId === userId && Number(message.turn) === Number(turn.turn) && !message.isBot) {
+        index = i;
+        break;
+      }
+    }
+  }
+
+  if (index >= 0) {
+    messages.splice(index, 1);
+    return true;
+  }
+  return false;
+}
+
 function hasPresentHumanPlayer(room) {
   return presentHumanUserIds(room).length > 0;
 }
@@ -850,6 +896,7 @@ function serializeRoom(room, viewerId) {
           ? [...room.players.keys()].filter((id) => id === viewerId && !eligibleUserIds.includes(id))
           : [...room.players.keys()].filter((id) => !eligibleUserIds.includes(id)),
         viewerSubmitted: room.currentTurn.actions.has(viewerId),
+        viewerCanWithdraw: canWithdrawTurnAction(room, viewerId),
         viewerCanAct: eligibleUserIds.includes(viewerId),
       }
     : null;
@@ -1214,6 +1261,38 @@ function retryTurnLlm(roomId, user) {
   appendMessage(room, 'system', `${user.username} 手动重试 LLM 结算。`);
   emitRoom(room);
   resolveTurn(room.id, 'manual-retry');
+  return room;
+}
+
+function withdrawTurnAction(roomId, user) {
+  const room = rooms.get(roomId);
+  if (!room || !room.players.has(user.id)) throw new Error('你不在这个房间中。');
+  if (room.status !== 'playing' || !room.currentTurn) throw new Error('当前不在行动阶段。');
+
+  const turn = room.currentTurn;
+  if (turn.resolving) throw new Error('本回合正在结算中，无法撤回行动。');
+  if (turn.llmError) throw new Error('LLM 调用失败，当前回合已锁定，等待房主重试。');
+  if (!turn.actions.has(user.id)) throw new Error('你还没有提交本回合行动。');
+
+  const pendingOtherIds = pendingOtherEligibleUserIds(room, user.id, turn);
+  if (!pendingOtherIds.length) throw new Error('其他可行动玩家都已提交，LLM 即将开始结算，无法撤回行动。');
+  if (!canWithdrawTurnAction(room, user.id)) throw new Error('当前无法撤回行动。');
+
+  const actionRecord = turn.actions.get(user.id);
+  turn.actions.delete(user.id);
+  removeSubmittedActionMessage(room, user.id, turn, actionRecord);
+
+  if (isPrivateInfoMode(room)) {
+    appendMessage(room, 'system', '你撤回了本回合行动，可重新编辑后提交。', {
+      recipients: [user.id],
+      privateTo: user.username,
+      visibilityLabel: '仅你可见',
+    });
+  } else {
+    appendMessage(room, 'system', `${user.username} 撤回了本回合行动，可重新提交。`);
+  }
+
+  emitRoom(room);
   return room;
 }
 
@@ -1823,18 +1902,20 @@ async function submitBotActions(roomId) {
 
       if (!rooms.has(roomId) || room.currentTurn !== turn || turn.resolving || turn.paused || turn.actions.has(bot.id)) break;
       const actionText = trimText(text, 700) || `${bot.username}谨慎观察局势，等待最佳时机支援队伍。`;
-      const actionRecord = { text: actionText, createdAt: nowIso(), isBot: true, location: normalizeLocation(bot.location) };
+      const actionRecord = { text: actionText, createdAt: nowIso(), isBot: true, location: normalizeLocation(bot.location), actionId: crypto.randomUUID() };
       turn.actions.set(bot.id, actionRecord);
       const privateAction = isPrivateInfoMode(room);
-      appendMessage(room, 'action', actionText, {
+      const actionMessage = appendMessage(room, 'action', actionText, {
         userId: bot.id,
         username: bot.username,
         turn: turn.turn,
         isBot: true,
         location: actionRecord.location,
+        actionId: actionRecord.actionId,
         visibilityLabel: privateAction ? 'Bot 私下行动' : '',
         recipients: privateAction ? [bot.id] : undefined,
       });
+      actionRecord.messageId = actionMessage.id;
       emitRoom(room);
     }
   } finally {
@@ -2066,6 +2147,16 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('turn:withdraw', (payload, ack) => {
+    try {
+      const roomIdToUpdate = String(payload?.roomId || userRooms.get(user.id) || '').toUpperCase();
+      const room = withdrawTurnAction(roomIdToUpdate, user);
+      ackOk(ack, { room: serializeRoom(room, user.id) });
+    } catch (error) {
+      ackError(ack, error);
+    }
+  });
+
   socket.on('turn:action', (payload, ack) => {
     try {
       const room = rooms.get(String(payload?.roomId || userRooms.get(user.id) || '').toUpperCase());
@@ -2084,17 +2175,19 @@ io.on('connection', (socket) => {
       const text = trimText(payload?.text, 700);
       if (text.length < 1) throw new Error('行动不能为空。');
 
-      const actionRecord = { text, createdAt: nowIso(), location: normalizeLocation(player.location) };
+      const actionRecord = { text, createdAt: nowIso(), location: normalizeLocation(player.location), actionId: crypto.randomUUID() };
       room.currentTurn.actions.set(user.id, actionRecord);
       const privateAction = isPrivateInfoMode(room);
-      appendMessage(room, 'action', text, {
+      const actionMessage = appendMessage(room, 'action', text, {
         userId: user.id,
         username: user.username,
         turn: room.currentTurn.turn,
         location: actionRecord.location,
+        actionId: actionRecord.actionId,
         visibilityLabel: privateAction ? '仅你与 GM 可见' : '',
         recipients: privateAction ? [user.id] : undefined,
       });
+      actionRecord.messageId = actionMessage.id;
       emitRoom(room);
       ackOk(ack);
       if (canSubmitDuringNoResponsePause) resumeNoResponseTurnAfterAction(room, `${user.username} 已提交行动`);

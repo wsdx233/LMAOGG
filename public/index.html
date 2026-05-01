@@ -240,7 +240,20 @@
             </div>
             <textarea id="composerInput" rows="3" maxlength="700" placeholder="输入本回合行动，例如：调查机械乌鸦的眼睛。"></textarea>
             <div class="composer-actions">
+              <div class="emoji-picker-shell">
+                <button id="emojiPickerButton" class="ghost-btn emoji-picker-button" type="button" aria-label="打开 Emoji 面板" aria-haspopup="dialog" aria-expanded="false" title="Emoji">😀</button>
+                <div id="emojiPickerPopover" class="emoji-picker-popover hidden" role="dialog" aria-label="选择 Emoji">
+                  <div class="emoji-picker-toolbar">
+                    <span>Emoji</span>
+                    <button id="closeEmojiPickerButton" class="ghost-btn small emoji-picker-close" type="button" aria-label="关闭 Emoji 面板">×</button>
+                  </div>
+                  <div id="quickEmojiList" class="quick-emoji-list" aria-label="常用 Emoji"></div>
+                  <emoji-picker id="emojiPicker" class="emoji-picker-element" locale="zh" data-source="https://cdn.jsdelivr.net/npm/emoji-picker-element-data@1/zh/emojibase/data.json"></emoji-picker>
+                  <p id="emojiPickerFallback" class="emoji-picker-fallback hidden">完整 Emoji 列表加载失败，可先使用上方常用表情。</p>
+                </div>
+              </div>
               <button id="sendChatButton" class="ghost-btn" type="button">发送聊天</button>
+              <button id="withdrawActionButton" class="ghost-btn hidden" type="button">撤回行动</button>
               <button id="submitActionButton" class="primary-btn" type="button">提交行动</button>
             </div>
           </footer>

@@ -1,5 +1,19 @@
 const $ = (id) => document.getElementById(id);
 
+const EMOJI_PICKER_CDN_URL = 'https://cdn.jsdelivr.net/npm/emoji-picker-element@1/index.js';
+const EMOJI_PICKER_I18N_CDN_URL = 'https://cdn.jsdelivr.net/npm/emoji-picker-element@1/i18n/zh_CN.js';
+const COMMON_EMOJIS = Object.freeze([
+  '😀', '😃', '😄', '😁', '😆', '😅', '😂', '🤣',
+  '😊', '😍', '😘', '🥰', '😎', '🤩', '🥳', '😇',
+  '🙂', '😉', '😌', '😋', '😜', '🤔', '🫡', '🤗',
+  '😢', '😭', '😤', '😡', '😱', '😳', '🥺', '😴',
+  '👍', '👎', '👌', '✌️', '🤞', '👏', '🙌', '🙏',
+  '💪', '🤝', '👀', '💬', '✨', '🔥', '💯', '❤️',
+  '🧡', '💛', '💚', '💙', '💜', '🖤', '⭐', '🌟',
+  '🎉', '🎊', '🎲', '🧭', '⚔️', '🛡️', '🏆', '🎒',
+  '📜', '🗡️', '🪄', '🐉', '👻', '🤖', '☕', '🍻',
+]);
+
 const state = {
   authMode: 'login',
   me: null,
@@ -14,6 +28,9 @@ const state = {
   lastMessageCount: 0,
   lastMessageId: '',
   unseenMessages: 0,
+  emojiPickerOpen: false,
+  emojiPickerReady: false,
+  emojiPickerLoading: null,
 };
 
 const STATUS_LABELS = {
@@ -107,7 +124,14 @@ const dom = {
   turnHint: $('turnHint'),
   turnClock: $('turnClock'),
   composerInput: $('composerInput'),
+  emojiPickerButton: $('emojiPickerButton'),
+  emojiPickerPopover: $('emojiPickerPopover'),
+  closeEmojiPickerButton: $('closeEmojiPickerButton'),
+  quickEmojiList: $('quickEmojiList'),
+  emojiPicker: $('emojiPicker'),
+  emojiPickerFallback: $('emojiPickerFallback'),
   sendChatButton: $('sendChatButton'),
+  withdrawActionButton: $('withdrawActionButton'),
   submitActionButton: $('submitActionButton'),
   dossierContent: $('dossierContent'),
 };
@@ -143,6 +167,7 @@ function setAuthMode(mode) {
 function showAuth() {
   closeDrawers();
   closeStartSetupModal();
+  closeEmojiPicker();
   state.me = null;
   state.currentRoom = null;
   state.rooms = [];
@@ -167,6 +192,7 @@ function showApp() {
 function showLobby() {
   state.view = 'lobby';
   closeDrawers();
+  closeEmojiPicker();
   dom.appView.classList.remove('game-mode');
   dom.lobbyView.classList.remove('hidden');
   dom.gameView.classList.add('hidden');
@@ -344,6 +370,89 @@ function el(tag, className, text) {
 
 function clear(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
+}
+
+function renderQuickEmojiList() {
+  if (!dom.quickEmojiList || dom.quickEmojiList.childElementCount) return;
+  const fragment = document.createDocumentFragment();
+  for (const emoji of COMMON_EMOJIS) {
+    const button = el('button', 'quick-emoji-button', emoji);
+    button.type = 'button';
+    button.dataset.emoji = emoji;
+    button.setAttribute('aria-label', `插入 ${emoji}`);
+    fragment.append(button);
+  }
+  dom.quickEmojiList.append(fragment);
+}
+
+function loadEmojiPickerLibrary() {
+  if (state.emojiPickerReady) return Promise.resolve();
+  if (state.emojiPickerLoading) return state.emojiPickerLoading;
+  dom.emojiPickerFallback?.classList.add('hidden');
+  dom.emojiPickerPopover?.classList.add('loading');
+  state.emojiPickerLoading = Promise.all([
+    import(EMOJI_PICKER_CDN_URL),
+    import(EMOJI_PICKER_I18N_CDN_URL).catch((error) => {
+      console.warn('[emoji] failed to load zh-CN i18n:', error);
+      return null;
+    }),
+  ])
+    .then(([, i18nModule]) => {
+      if (dom.emojiPicker) {
+        dom.emojiPicker.locale = 'zh';
+        if (i18nModule?.default) dom.emojiPicker.i18n = i18nModule.default;
+      }
+      state.emojiPickerReady = true;
+      dom.emojiPickerPopover?.classList.remove('loading');
+    })
+    .catch((error) => {
+      console.warn('[emoji] failed to load emoji-picker-element:', error);
+      dom.emojiPickerPopover?.classList.remove('loading');
+      dom.emojiPickerFallback?.classList.remove('hidden');
+      state.emojiPickerLoading = null;
+    });
+  return state.emojiPickerLoading;
+}
+
+function setEmojiPickerOpen(open) {
+  if (!dom.emojiPickerButton || !dom.emojiPickerPopover) return;
+  const shouldOpen = Boolean(open && !dom.emojiPickerButton.disabled);
+  state.emojiPickerOpen = shouldOpen;
+  dom.emojiPickerPopover.classList.toggle('hidden', !shouldOpen);
+  dom.emojiPickerButton.classList.toggle('active', shouldOpen);
+  dom.emojiPickerButton.setAttribute('aria-expanded', String(shouldOpen));
+  if (shouldOpen) {
+    renderQuickEmojiList();
+    loadEmojiPickerLibrary();
+  }
+}
+
+function closeEmojiPicker() {
+  setEmojiPickerOpen(false);
+}
+
+function insertEmojiIntoComposer(emoji) {
+  const text = String(emoji || '');
+  const input = dom.composerInput;
+  if (!text || !input || input.disabled) return;
+
+  const value = input.value || '';
+  const start = Number.isInteger(input.selectionStart) ? input.selectionStart : value.length;
+  const end = Number.isInteger(input.selectionEnd) ? input.selectionEnd : start;
+  const nextValue = `${value.slice(0, start)}${text}${value.slice(end)}`;
+  const maxLength = Number(input.getAttribute('maxlength') || input.maxLength || 0);
+
+  if (maxLength > 0 && nextValue.length > maxLength) {
+    showToast(`最多可输入 ${maxLength} 个字符，无法继续插入 Emoji。`, 'error');
+    input.focus();
+    return;
+  }
+
+  input.value = nextValue;
+  const caret = start + text.length;
+  input.focus();
+  input.setSelectionRange(caret, caret);
+  input.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
 function statusBadge(status) {
@@ -764,21 +873,28 @@ function updateComposer(room) {
   const isPaused = Boolean(turn?.paused);
   const canSubmitDuringNoResponsePause = Boolean(isPaused && turn?.pauseKind === 'no-response');
   const submitted = Boolean(turn?.viewerSubmitted);
+  const canWithdraw = Boolean(turn?.viewerCanWithdraw);
   const viewer = room.players.find((player) => player.id === state.me?.id);
   const viewerCanAct = Boolean(turn?.viewerCanAct);
   const viewerCanPerceive = viewer?.condition?.canPerceive !== false;
   const privateMode = PRIVATE_INFO_MODES.has(room.playMode || room.game?.playMode);
 
   dom.sendChatButton.textContent = privateMode ? '说话' : '发送聊天';
-  dom.submitActionButton.textContent = privateMode ? '行动' : '提交行动';
+  dom.withdrawActionButton.textContent = '撤回行动';
+  dom.withdrawActionButton.classList.toggle('hidden', !canWithdraw);
+  dom.withdrawActionButton.disabled = !canWithdraw;
+  dom.submitActionButton.textContent = submitted ? '已提交' : (privateMode ? '行动' : '提交行动');
   dom.progressTrack.classList.toggle('hidden', !inPlayingTurn);
   dom.progressTrack.classList.toggle('resolving', isResolving);
   dom.progressTrack.classList.toggle('paused', isPaused);
   dom.progressTrack.classList.toggle('error', Boolean(turn?.llmError));
   const blocksPrivateSpeech = room.status === 'playing' && privateMode && !viewerCanPerceive;
+  const composerDisabled = room.status === 'starting' || blocksPrivateSpeech;
   dom.submitActionButton.disabled = !(inPlayingTurn && !isResolving && (!isPaused || canSubmitDuringNoResponsePause) && !submitted && viewerCanAct);
-  dom.sendChatButton.disabled = room.status === 'starting' || blocksPrivateSpeech;
-  dom.composerInput.disabled = room.status === 'starting' || blocksPrivateSpeech;
+  dom.sendChatButton.disabled = composerDisabled;
+  dom.composerInput.disabled = composerDisabled;
+  dom.emojiPickerButton.disabled = composerDisabled;
+  if (composerDisabled) closeEmojiPicker();
 
   if (room.status === 'waiting') {
     dom.turnHint.textContent = room.hostId === state.me?.id ? '你是房主：可等待玩家加入，或直接开始。' : '等待房主开始游戏。';
@@ -827,7 +943,9 @@ function updateComposer(room) {
     dom.composerInput.placeholder = privateMode ? '你现在无法行动；可以说话（同空间可听）或等待局势改变。' : '你现在无法行动；可以发送聊天或等待同伴/剧情改变状态。';
   } else if (submitted) {
     const pending = turn.pendingCount ?? turn.pendingUserIds?.length ?? 0;
-    dom.turnHint.textContent = `你已提交行动。等待 ${pending} 名玩家，或倒计时结束。`;
+    dom.turnHint.textContent = canWithdraw
+      ? `你已提交行动。等待 ${pending} 名玩家；LLM 结算前可撤回修改。`
+      : `你已提交行动。等待 ${pending} 名玩家，或倒计时结束。`;
     dom.composerInput.placeholder = privateMode ? '已提交行动；也可以说话，只有同空间角色能听见。' : '已提交行动；也可以发送聊天。';
   } else if (turn) {
     dom.turnHint.textContent = privateMode
@@ -1027,6 +1145,31 @@ async function leaveRoom() {
   }
 }
 
+async function withdrawAction() {
+  if (!state.currentRoom) return;
+  const turnNumber = Number(state.currentRoom.currentTurn?.turn || 0);
+  const withdrawnText = [...(state.currentRoom.messages || [])]
+    .reverse()
+    .find((message) => message.type === 'action' && message.userId === state.me?.id && Number(message.turn) === turnNumber)
+    ?.text || '';
+
+  dom.withdrawActionButton.disabled = true;
+  try {
+    const response = await emitAck('turn:withdraw', { roomId: state.currentRoom.id });
+    if (response.room) {
+      state.currentRoom = response.room;
+      if (state.view === 'game') renderGame();
+    }
+    if (!dom.composerInput.value.trim() && withdrawnText) dom.composerInput.value = withdrawnText;
+    showToast('已撤回行动，可修改后重新提交。', 'success');
+    dom.composerInput.focus();
+  } catch (error) {
+    showToast(error.message, 'error');
+  } finally {
+    dom.withdrawActionButton.disabled = false;
+  }
+}
+
 async function submitAction() {
   const text = dom.composerInput.value.trim();
   if (!text) return showToast('先写下你的行动。', 'error');
@@ -1050,6 +1193,7 @@ async function sendChat() {
 }
 
 function bindEvents() {
+  renderQuickEmojiList();
   dom.loginTab.addEventListener('click', () => setAuthMode('login'));
   dom.registerTab.addEventListener('click', () => setAuthMode('register'));
   dom.authForm.addEventListener('submit', submitAuth);
@@ -1091,6 +1235,28 @@ function bindEvents() {
   dom.endAdventureButton.addEventListener('click', endAdventure);
   dom.deleteRoomButton.addEventListener('click', deleteCurrentRoom);
   dom.leaveRoomButton.addEventListener('click', leaveRoom);
+  dom.emojiPickerButton.addEventListener('click', (event) => {
+    event.stopPropagation();
+    setEmojiPickerOpen(!state.emojiPickerOpen);
+  });
+  dom.closeEmojiPickerButton.addEventListener('click', (event) => {
+    event.stopPropagation();
+    closeEmojiPicker();
+    dom.composerInput.focus();
+  });
+  dom.emojiPickerPopover.addEventListener('click', (event) => event.stopPropagation());
+  dom.quickEmojiList.addEventListener('click', (event) => {
+    const button = event.target instanceof Element ? event.target.closest('[data-emoji]') : null;
+    if (!button) return;
+    insertEmojiIntoComposer(button.dataset.emoji);
+    closeEmojiPicker();
+  });
+  dom.emojiPicker.addEventListener('emoji-click', (event) => {
+    const emoji = event.detail?.unicode || event.detail?.emoji?.unicode || event.detail?.emoji?.emoji || event.detail?.emoji?.native || '';
+    insertEmojiIntoComposer(emoji);
+    closeEmojiPicker();
+  });
+  dom.withdrawActionButton.addEventListener('click', withdrawAction);
   dom.submitActionButton.addEventListener('click', submitAction);
   dom.sendChatButton.addEventListener('click', sendChat);
   dom.composerInput.addEventListener('keydown', (event) => {
@@ -1099,8 +1265,16 @@ function bindEvents() {
       submitAction();
     }
   });
+  document.addEventListener('click', (event) => {
+    if (!state.emojiPickerOpen) return;
+    if (dom.emojiPickerButton.contains(event.target) || dom.emojiPickerPopover.contains(event.target)) return;
+    closeEmojiPicker();
+  });
   document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') closeStartSetupModal();
+    if (event.key === 'Escape') {
+      closeStartSetupModal();
+      closeEmojiPicker();
+    }
   });
   document.addEventListener('visibilitychange', updateProgress);
 }
