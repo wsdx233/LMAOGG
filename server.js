@@ -11,7 +11,7 @@ import bcrypt from 'bcryptjs';
 import { Server } from 'socket.io';
 
 import { createUser, findUserById, findUserByUsername } from './src/store.js';
-import { generateBotAction, generateBotChatReply, generateGameSetup, generateGmInquiryReply, generateTurnNarration, getTurnTimeoutMs } from './src/llm.js';
+import { generateBotAction, generateBotChatReply, generateBotTurnDecision, generateGameSetup, generateGmInquiryReply, generateTurnNarration, getTurnTimeoutMs } from './src/llm.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
@@ -24,6 +24,8 @@ const MAX_BOT_CHAT_CHAIN_DEPTH = 2;
 const BOT_CHAT_COOLDOWN_MS = 12000;
 const BOT_CHAT_RESPONSE_DELAY_MS = 700;
 const MAX_TURN_INQUIRIES_PER_PLAYER = 3;
+const MAX_BOT_TURN_DECISION_STEPS = 4;
+const BOT_TURN_DECISION_DELAY_MS = 450;
 const ROOMS_FILE = path.resolve('data', 'rooms.json');
 const USERNAME_RE = /^[\p{L}\p{N}_-]{3,20}$/u;
 const DEFAULT_STATS = {
@@ -144,6 +146,10 @@ function roomPublicId() {
 function trimText(input, maxLength) {
   const text = String(input || '').replace(/\s+/g, ' ').trim();
   return text.length > maxLength ? text.slice(0, maxLength) : text;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function clampNumber(value, fallback = 0, min = 0, max = 9999) {
@@ -421,6 +427,7 @@ function makeBotRecord(room, requestedName = '') {
     statusTags: ['清醒', 'Bot'],
     stats: defaultStats(),
     location: normalizeLocation(),
+    proactiveStopped: false,
   });
 }
 
@@ -839,7 +846,7 @@ function removeSubmittedActionMessage(room, userId, turn, actionRecord) {
   if (index < 0) {
     for (let i = messages.length - 1; i >= 0; i -= 1) {
       const message = messages[i];
-      if (message.type === 'action' && message.userId === userId && Number(message.turn) === Number(turn.turn) && !message.isBot) {
+      if (message.type === 'action' && message.userId === userId && Number(message.turn) === Number(turn.turn)) {
         index = i;
         break;
       }
@@ -1040,6 +1047,7 @@ function serializeRoomForPersistence(room) {
         statusTags: player.statusTags || [],
         stats: player.stats || defaultStats(),
         location: normalizeLocation(player.location),
+        proactiveStopped: Boolean(player.proactiveStopped),
       };
     }),
     messages: room.messages || [],
@@ -1156,6 +1164,7 @@ function loadPersistedRooms() {
         statusTags: normalizeStatusTags(player.statusTags || ['清醒']),
         stats: normalizeStats(player.stats || defaultStats()),
         location: normalizeLocation(player.location),
+        proactiveStopped: Boolean(player.proactiveStopped),
       });
       room.players.set(record.id, record);
       if (!record.isBot) userRooms.set(record.id, room.id);
@@ -1468,6 +1477,96 @@ function appendBotChatMessage(room, bot, text, triggerMessage) {
   });
 }
 
+function submitBotActionRecord(room, turn, bot, text, { passive = false } = {}) {
+  const actionText = trimText(text, 700) || (passive ? `${bot.username}保持观察，等待队伍指示。` : `${bot.username}谨慎观察局势，等待最佳时机支援队伍。`);
+  const actionRecord = { text: actionText, createdAt: nowIso(), isBot: true, location: normalizeLocation(bot.location), actionId: crypto.randomUUID(), passive };
+  turn.actions.set(bot.id, actionRecord);
+  const privateAction = isPrivateInfoMode(room);
+  const actionMessage = appendMessage(room, 'action', actionText, {
+    userId: bot.id,
+    username: bot.username,
+    turn: turn.turn,
+    isBot: true,
+    location: actionRecord.location,
+    actionId: actionRecord.actionId,
+    visibilityLabel: privateAction ? (passive ? 'Bot 私下待命' : 'Bot 私下行动') : (passive ? 'Bot 待命' : ''),
+    recipients: privateAction ? [bot.id] : undefined,
+  });
+  actionRecord.messageId = actionMessage.id;
+  return actionRecord;
+}
+
+async function appendBotGmInquiry(room, turn, bot, question) {
+  const inquiryCount = turnInquiryCount(turn, bot.id);
+  if (inquiryCount >= MAX_TURN_INQUIRIES_PER_PLAYER) return '';
+  const cleanQuestion = normalizeStateText(question, 360);
+  if (!cleanQuestion) return '';
+  setTurnInquiryCount(turn, bot.id, inquiryCount + 1);
+
+  const privateAnswer = isPrivateInfoMode(room);
+  const recipients = privateAnswer ? [bot.id] : undefined;
+  const location = normalizeLocation(bot.location);
+  const askMessage = appendMessage(room, 'ask', cleanQuestion, {
+    userId: bot.id,
+    username: bot.username,
+    isBot: true,
+    turn: turn.turn,
+    location,
+    recipients,
+    privateTo: privateAnswer ? bot.username : '',
+    visibilityLabel: privateAnswer ? 'Bot 询问 GM' : '询问 GM',
+  });
+  emitRoom(room);
+
+  const recentMessages = (privateAnswer ? room.messages.filter((message) => messageVisibleToViewer(message, bot.id)) : room.messages)
+    .map((message) => llmMessageContext(room, message));
+  const answer = normalizeStateText(await generateGmInquiryReply({ room, player: bot, question: cleanQuestion, recentMessages }), 1200);
+  if (room.currentTurn !== turn) return answer;
+  appendMessage(room, 'gm', answer || 'GM 暂时没有更多可透露的信息。', {
+    username: 'LLM GM',
+    turn: turn.turn,
+    inquiryId: askMessage.id,
+    recipients,
+    privateTo: privateAnswer ? bot.username : '',
+    visibilityLabel: privateAnswer ? 'GM 私下回答' : 'GM 回答',
+  });
+  emitRoom(room);
+  return answer;
+}
+
+function canBotReviseTurnAction(room, bot, triggerMessage) {
+  const turn = room?.currentTurn;
+  if (!room || room.status !== 'playing' || !turn || turn.paused || turn.resolving || turn.llmError) return false;
+  if (!bot?.isBot || !turn.actions?.has(bot.id) || !canPlayerAct(bot)) return false;
+  if (!botCanHearChatMessage(room, bot, triggerMessage)) return false;
+  return pendingOtherEligibleUserIds(room, bot.id, turn).length > 0;
+}
+
+function withdrawBotActionForRevision(room, bot, triggerMessage) {
+  const turn = room?.currentTurn;
+  if (!canBotReviseTurnAction(room, bot, triggerMessage)) return false;
+  const actionRecord = turn.actions.get(bot.id);
+  turn.actions.delete(bot.id);
+  removeSubmittedActionMessage(room, bot.id, turn, actionRecord);
+  return true;
+}
+
+function wakeOrReviseBotsByMessage(room, triggerMessage) {
+  if (!room || !triggerMessage || triggerMessage.isBot || !isChatMessageType(triggerMessage)) return false;
+  let shouldRunBots = false;
+  for (const bot of room.players.values()) {
+    if (!bot?.isBot || !botCanHearChatMessage(room, bot, triggerMessage)) continue;
+    if (bot.proactiveStopped) {
+      bot.proactiveStopped = false;
+      if (withdrawBotActionForRevision(room, bot, triggerMessage)) shouldRunBots = true;
+      continue;
+    }
+    if (withdrawBotActionForRevision(room, bot, triggerMessage)) shouldRunBots = true;
+  }
+  if (shouldRunBots) emitRoom(room);
+  return shouldRunBots;
+}
+
 function scheduleBotChatResponses(roomId, triggerMessageId) {
   if (!roomId || !triggerMessageId) return;
   const key = `${roomId}:${triggerMessageId}`;
@@ -1487,12 +1586,16 @@ async function submitBotChatResponses(roomId, triggerMessageId) {
   if (!room || room.status === 'starting') return;
   const triggerMessage = room.messages.find((message) => message.id === triggerMessageId);
   if (!triggerMessage || !isChatMessageType(triggerMessage)) return;
+  const shouldRunBotsAfterChat = wakeOrReviseBotsByMessage(room, triggerMessage);
 
   triggerMessage.botChatAttemptedResponderIds = Array.isArray(triggerMessage.botChatAttemptedResponderIds)
     ? triggerMessage.botChatAttemptedResponderIds
     : [];
   const candidates = eligibleBotChatResponders(room, triggerMessage);
-  if (!candidates.length) return;
+  if (!candidates.length) {
+    if (shouldRunBotsAfterChat) setTimeout(() => submitBotActions(room.id), 500);
+    return;
+  }
 
   const maxResponses = triggerMessage.isBot ? 1 : MAX_BOT_CHAT_RESPONSES_PER_MESSAGE;
   let responseCount = 0;
@@ -1533,6 +1636,8 @@ async function submitBotChatResponses(roomId, triggerMessageId) {
       scheduleBotChatResponses(room.id, message.id);
     }
   }
+
+  if (shouldRunBotsAfterChat) setTimeout(() => submitBotActions(room.id), 500);
 }
 
 function pauseTurn(room, kind, reason, message, { resetRemaining = false } = {}) {
@@ -1893,6 +1998,7 @@ async function startGame(roomId, starterId, rawSetupOptions = {}) {
       player.statusTags = normalizeStatusTags(generated.statusTags || ['清醒']);
       player.stats = normalizeStats(generated.stats || defaultStats());
       player.location = normalizeLocation(generated.location);
+      if (player.isBot) player.proactiveStopped = false;
       applyVitalsRules(player);
     }
   }
@@ -1975,6 +2081,93 @@ function beginTurn(room) {
   emitRoom(room);
 }
 
+function botTurnStillActive(roomId, room, turn, bot) {
+  return rooms.has(roomId)
+    && room.currentTurn === turn
+    && room.status === 'playing'
+    && !turn.resolving
+    && !turn.paused
+    && !turn.actions.has(bot.id)
+    && room.players.has(bot.id)
+    && canPlayerAct(room.players.get(bot.id));
+}
+
+async function runBotTurnDecisions(roomId, room, turn, bot) {
+  if (bot.proactiveStopped) {
+    submitBotActionRecord(room, turn, bot, `${bot.username}保持观察，等待队伍指示。`, { passive: true });
+    emitRoom(room);
+    return;
+  }
+
+  for (let step = 1; step <= MAX_BOT_TURN_DECISION_STEPS; step += 1) {
+    if (!botTurnStillActive(roomId, room, turn, bot)) return;
+    const recentMessages = (isPrivateInfoMode(room) ? room.messages.filter((message) => messageVisibleToViewer(message, bot.id)) : room.messages)
+      .map((message) => llmMessageContext(room, message));
+    const inquiryRemaining = Math.max(0, MAX_TURN_INQUIRIES_PER_PLAYER - turnInquiryCount(turn, bot.id));
+
+    let decision;
+    try {
+      decision = await generateBotTurnDecision({ room, bot, recentMessages, step, maxSteps: MAX_BOT_TURN_DECISION_STEPS, inquiryRemaining });
+    } catch (error) {
+      console.error('[bot] failed to generate turn decision after retries:', error);
+      markTurnLlmError(room, turn, 'bot-decision', error);
+      return;
+    }
+
+    if (!botTurnStillActive(roomId, room, turn, bot)) return;
+    const kind = String(decision?.decision || 'action').toLowerCase();
+    const text = trimText(decision?.text, kind === 'action' ? 700 : 360);
+
+    if (kind === 'say') {
+      if (text) {
+        bot.lastBotChatAt = Date.now();
+        appendBotChatMessage(room, bot, text, null);
+        emitRoom(room);
+      }
+      await sleep(BOT_TURN_DECISION_DELAY_MS);
+      continue;
+    }
+
+    if (kind === 'ask') {
+      if (inquiryRemaining > 0 && text) {
+        try {
+          await appendBotGmInquiry(room, turn, bot, text);
+        } catch (error) {
+          console.error('[bot] GM inquiry failed:', error);
+          markTurnLlmError(room, turn, 'bot-inquiry', error);
+          return;
+        }
+      }
+      await sleep(BOT_TURN_DECISION_DELAY_MS);
+      continue;
+    }
+
+    if (kind === 'stop') {
+      bot.proactiveStopped = true;
+      submitBotActionRecord(room, turn, bot, text || `${bot.username}停止主动推进，保持观察并等待队伍呼唤。`, { passive: true });
+      emitRoom(room);
+      return;
+    }
+
+    submitBotActionRecord(room, turn, bot, text || `${bot.username}谨慎观察局势，等待最佳时机支援队伍。`);
+    emitRoom(room);
+    return;
+  }
+
+  if (botTurnStillActive(roomId, room, turn, bot)) {
+    const recentMessages = (isPrivateInfoMode(room) ? room.messages.filter((message) => messageVisibleToViewer(message, bot.id)) : room.messages)
+      .map((message) => llmMessageContext(room, message));
+    let fallbackAction = `${bot.username}谨慎观察局势，等待最佳时机支援队伍。`;
+    try {
+      fallbackAction = await generateBotAction({ room, bot, recentMessages });
+    } catch (error) {
+      console.error('[bot] fallback action generation failed:', error);
+    }
+    submitBotActionRecord(room, turn, bot, fallbackAction);
+    emitRoom(room);
+  }
+}
+
 async function submitBotActions(roomId) {
   const room = rooms.get(roomId);
   const turn = room?.currentTurn;
@@ -1988,36 +2181,8 @@ async function submitBotActions(roomId) {
   turn.botSubmitting = true;
   try {
     for (const bot of bots) {
-      if (!rooms.has(roomId) || room.currentTurn !== turn || turn.resolving || turn.paused || turn.actions.has(bot.id)) break;
-      const recentMessages = (isPrivateInfoMode(room) ? room.messages.filter((message) => messageVisibleToViewer(message, bot.id)) : room.messages)
-        .map((message) => llmMessageContext(room, message));
-
-      let text;
-      try {
-        text = await generateBotAction({ room, bot, recentMessages });
-      } catch (error) {
-        console.error('[bot] failed to generate action after retries:', error);
-        markTurnLlmError(room, turn, 'bot-action', error);
-        return;
-      }
-
-      if (!rooms.has(roomId) || room.currentTurn !== turn || turn.resolving || turn.paused || turn.actions.has(bot.id)) break;
-      const actionText = trimText(text, 700) || `${bot.username}谨慎观察局势，等待最佳时机支援队伍。`;
-      const actionRecord = { text: actionText, createdAt: nowIso(), isBot: true, location: normalizeLocation(bot.location), actionId: crypto.randomUUID() };
-      turn.actions.set(bot.id, actionRecord);
-      const privateAction = isPrivateInfoMode(room);
-      const actionMessage = appendMessage(room, 'action', actionText, {
-        userId: bot.id,
-        username: bot.username,
-        turn: turn.turn,
-        isBot: true,
-        location: actionRecord.location,
-        actionId: actionRecord.actionId,
-        visibilityLabel: privateAction ? 'Bot 私下行动' : '',
-        recipients: privateAction ? [bot.id] : undefined,
-      });
-      actionRecord.messageId = actionMessage.id;
-      emitRoom(room);
+      if (!botTurnStillActive(roomId, room, turn, bot)) break;
+      await runBotTurnDecisions(roomId, room, turn, bot);
     }
   } finally {
     if (room.currentTurn === turn) turn.botSubmitting = false;
