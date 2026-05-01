@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const DEFAULT_TURN_TIMEOUT_MS = 180000;
 const DEFAULT_LLM_MAX_RETRIES = 3;
@@ -30,6 +32,58 @@ function providerName() {
 
 function useMockProvider() {
   return providerName() === 'mock' || !process.env.LLM_API_KEY;
+}
+
+function llmDebugLogEnabled() {
+  return envFlag('LLM_DEBUG_LOG');
+}
+
+function llmDebugLogFile() {
+  return path.resolve(process.env.LLM_DEBUG_LOG_FILE || path.join('data', 'llm-debug.log'));
+}
+
+function truncateForConsole(value, limit = LLM_DEBUG_CONSOLE_STRING_LIMIT, depth = 0) {
+  if (typeof value === 'string') {
+    return value.length > limit ? `${value.slice(0, limit)}…[truncated ${value.length - limit} chars]` : value;
+  }
+  if (value === null || typeof value !== 'object') return value;
+  if (depth > 8) return '[MaxDepth]';
+  if (Array.isArray(value)) return value.map((item) => truncateForConsole(item, limit, depth + 1));
+  return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, truncateForConsole(entry, limit, depth + 1)]));
+}
+
+function safeHeadersForDebug(headers = {}) {
+  const safe = { ...headers };
+  for (const key of Object.keys(safe)) {
+    if (/authorization|api[-_]?key|token|secret/i.test(key)) safe[key] = '[redacted]';
+  }
+  return safe;
+}
+
+function writeLlmDebugLog(kind, payload = {}) {
+  if (!llmDebugLogEnabled()) return;
+  const entry = {
+    at: new Date().toISOString(),
+    kind,
+    ...payload,
+  };
+
+  try {
+    console.log(`[llm-debug] ${kind}`, JSON.stringify(truncateForConsole(entry), null, 2));
+  } catch {
+    console.log(`[llm-debug] ${kind}`, truncateForConsole(String(payload || '')));
+  }
+
+  try {
+    const file = llmDebugLogFile();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, `${JSON.stringify(entry, null, 2)}\n\n`, 'utf8');
+  } catch (error) {
+    if (!llmDebugLogWarned) {
+      llmDebugLogWarned = true;
+      console.warn('[llm-debug] failed to write debug log file:', error);
+    }
+  }
 }
 
 function thinkingEffort() {
@@ -367,60 +421,119 @@ async function requestChatCompletion(body, { signal }) {
   if (process.env.LLM_HTTP_REFERER) headers['HTTP-Referer'] = process.env.LLM_HTTP_REFERER;
   if (process.env.LLM_APP_TITLE) headers['X-Title'] = process.env.LLM_APP_TITLE;
 
-  async function send(payload) {
-    return fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers,
-      signal,
-      body: JSON.stringify(payload),
+  const requestId = crypto.randomUUID();
+  let httpAttempt = 0;
+
+  async function send(payload, phase = 'request') {
+    httpAttempt += 1;
+    const attempt = httpAttempt;
+    const url = `${baseUrl}/chat/completions`;
+    const startedAt = Date.now();
+    writeLlmDebugLog('request', {
+      requestId,
+      attempt,
+      phase,
+      url,
+      provider: providerName(),
+      model: payload?.model,
+      headers: safeHeadersForDebug(headers),
+      body: payload,
     });
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers,
+        signal,
+        body: JSON.stringify(payload),
+      });
+      response.llmDebugMeta = { requestId, attempt, phase, durationMs: Date.now() - startedAt };
+      return response;
+    } catch (error) {
+      writeLlmDebugLog('transport-error', {
+        requestId,
+        attempt,
+        phase,
+        durationMs: Date.now() - startedAt,
+        error: error instanceof Error ? { name: error.name, message: error.message, stack: error.stack } : String(error),
+      });
+      throw error;
+    }
   }
 
-  let response = await send(body);
+  async function readResponseText(response, kind = 'response') {
+    const text = await response.text().catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      writeLlmDebugLog('response-read-error', {
+        ...(response.llmDebugMeta || { requestId }),
+        status: response.status,
+        statusText: response.statusText,
+        error: message,
+      });
+      return '';
+    });
+    writeLlmDebugLog(kind, {
+      ...(response.llmDebugMeta || { requestId }),
+      status: response.status,
+      statusText: response.statusText,
+      body: text,
+    });
+    return text;
+  }
+
+  let response = await send(body, 'initial');
   if (!response.ok && body.reasoning_effort) {
-    const detail = await response.text().catch(() => '');
+    const detail = await readResponseText(response, 'response-error');
     if (/reasoning_effort|thinking_effort|unsupported|unrecognized|unknown parameter|extra_forbidden/i.test(detail)) {
       const retryBody = { ...body };
       delete retryBody.reasoning_effort;
       console.warn('[llm] provider rejected reasoning_effort; retrying without it. Detail:', detail.slice(0, 300));
-      response = await send(retryBody);
+      response = await send(retryBody, 'retry-without-reasoning-effort');
     } else {
       throw new Error(`LLM request failed: ${response.status} ${response.statusText} ${detail}`.trim());
     }
   }
 
   if (!response.ok && body.tools?.length) {
-    const detail = await response.text().catch(() => '');
+    const detail = await readResponseText(response, 'response-error');
     if (/tools|tool_choice|tool_calls|function call|unsupported|unrecognized|unknown parameter|extra_forbidden/i.test(detail)) {
       const retryBody = { ...body };
       delete retryBody.tools;
       delete retryBody.tool_choice;
       console.warn('[llm] provider rejected tools; retrying without tool support. Detail:', detail.slice(0, 300));
-      response = await send(retryBody);
+      response = await send(retryBody, 'retry-without-tools');
     } else {
       throw new Error(`LLM request failed: ${response.status} ${response.statusText} ${detail}`.trim());
     }
   }
 
   if (!response.ok) {
-    const detail = await response.text().catch(() => '');
+    const detail = await readResponseText(response, 'response-error');
     throw new Error(`LLM request failed: ${response.status} ${response.statusText} ${detail}`.trim());
   }
 
-  const payload = await response.json();
+  const responseText = await readResponseText(response, 'response');
+  let payload;
+  try {
+    payload = JSON.parse(responseText);
+  } catch (error) {
+    throw new Error(`LLM response was not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
   const message = payload?.choices?.[0]?.message;
   if (!message) throw new Error('LLM response missing choices[0].message');
   return message;
 }
 
-async function callOpenAICompatibleOnce(messages, { temperature, timeoutMs, tools = [], maxToolRounds = 3 } = {}) {
+async function callOpenAICompatibleOnce(messages, { temperature, timeoutMs, tools = [], maxToolRounds = 3, maxToolJsonRetryRequests = MAX_TOOL_JSON_RETRY_REQUESTS } = {}) {
   const model = process.env.LLM_MODEL || 'gpt-4o-mini';
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Number(timeoutMs || process.env.LLM_TIMEOUT_MS || 45000));
   const workingMessages = messages.map((message) => ({ ...message }));
+  let successfulToolRounds = 0;
+  let toolJsonRetryRequests = 0;
+  const totalRoundLimit = maxToolRounds + maxToolJsonRetryRequests;
 
   try {
-    for (let round = 0; round <= maxToolRounds; round += 1) {
+    for (let round = 0; round <= totalRoundLimit; round += 1) {
       const body = {
         model,
         messages: workingMessages,
