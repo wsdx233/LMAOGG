@@ -956,6 +956,27 @@ function normalizeBotTurnDecision(payload, fallbackAction = '') {
   };
 }
 
+function normalizeBotRevisionDecision(payload, fallback = { shouldRevise: false, reason: '' }) {
+  if (typeof payload === 'boolean') return { shouldRevise: payload, reason: '' };
+  if (!payload || typeof payload !== 'object') return fallback;
+  return {
+    shouldRevise: Boolean(payload.shouldRevise ?? payload.revise ?? payload.wake ?? payload.shouldWake ?? payload.changeAction),
+    reason: clampText(payload.reason || payload.explanation || '', 240),
+  };
+}
+
+function mockBotRevisionDecision({ bot, triggerMessage, currentAction }) {
+  const text = String(triggerMessage?.text || '').toLowerCase();
+  const mentioned = bot?.username && (text.includes(String(bot.username).toLowerCase()) || text.includes(`@${String(bot.username).toLowerCase()}`));
+  const asksQuestion = /[？?]|怎么|如何|要不要|可以吗|怎么办|改|换|别|等等|等一下|停|帮|需要|你来/.test(text);
+  const passive = Boolean(currentAction?.passive || bot?.proactiveStopped);
+  const shouldRevise = Boolean(mentioned || (passive && asksQuestion) || (asksQuestion && Math.random() < 0.55));
+  return {
+    shouldRevise,
+    reason: shouldRevise ? '新消息可能影响当前动作，重新决策。' : '新消息不足以改变当前动作。',
+  };
+}
+
 function mockBotTurnDecision({ room, bot, step = 1, inquiryRemaining = 0, recentMessages }) {
   if (step === 1 && inquiryRemaining > 0 && Math.random() < 0.18) {
     return { decision: 'ask', text: '我现在能从当前位置看出最大的风险或最明显的线索是什么？', reason: '先向 GM 确认当前视角可知信息。' };
@@ -967,6 +988,90 @@ function mockBotTurnDecision({ room, bot, step = 1, inquiryRemaining = 0, recent
     return { decision: 'stop', text: '我先停止主动推进，保持观察，等你们叫我。', reason: '避免 Bot 抢节奏。' };
   }
   return { decision: 'action', text: mockBotAction({ room, bot, recentMessages }), reason: '提交本回合行动。' };
+}
+
+export async function generateBotRevisionDecision({ room, bot, triggerMessage, currentAction, recentMessages }) {
+  const fallback = mockBotRevisionDecision({ bot, triggerMessage, currentAction });
+  if (useMockProvider()) return fallback;
+
+  const playMode = normalizeGameMode(room.game?.playMode || room.playMode);
+  const privateMode = isPrivateInfoMode(playMode);
+  const botLocation = normalizeLocation(bot.location);
+  const playerSummary = Array.from(room.players.values()).map((player) => {
+    const sameSpace = normalizeLocation(player.location).id === botLocation.id;
+    if (privateMode && player.id !== bot.id) {
+      return {
+        username: player.username,
+        isBot: Boolean(player.isBot),
+        knownScope: sameSpace ? '同空间可观察/可听见' : '不同空间/信息未共享',
+        location: sameSpace ? normalizeLocation(player.location) : { id: 'unknown', label: '未知空间' },
+      };
+    }
+    return {
+      username: player.username,
+      isBot: Boolean(player.isBot),
+      role: player.role,
+      personalGoal: player.personalGoal,
+      inventory: player.inventory,
+      statusTags: player.statusTags,
+      stats: player.stats,
+      location: normalizeLocation(player.location),
+    };
+  });
+  const fixedContext = {
+    title: room.game?.title || room.name,
+    setting: room.game?.setting || '尚未开局或公开设定较少。',
+    globalGoal: room.game?.globalGoal || '',
+    playMode,
+    turnNumber: room.turnNumber || 0,
+    bot: { username: bot.username, role: bot.role, personalGoal: bot.personalGoal, inventory: bot.inventory, statusTags: bot.statusTags, stats: bot.stats, location: botLocation, proactiveStopped: Boolean(bot.proactiveStopped) },
+    currentAction,
+    triggerMessage,
+    playerSummary,
+  };
+  const historyContext = buildMessageHistoryContext(recentMessages, fixedContext);
+
+  const messages = [
+    {
+      role: 'system',
+      content: '你正在扮演多人文字冒险中的 LLM Bot 玩家角色。你不是 GM，不能宣布行动结果或世界事实。现在真人玩家说了一句话/发了一条消息，你需要判断这是否足以让你撤回当前已提交行动或从待命中醒来并重新决策。只做是否重新决策的判断，不要直接写新行动。必须尊重信息权限：你只能基于自己能听见/看见/知道的信息判断。只输出严格 JSON。',
+    },
+    {
+      role: 'user',
+      content: `游戏标题：${room.game?.title || room.name}
+世界设定：${room.game?.setting || '尚未开局'}
+公开目标/局势：${room.game?.globalGoal || '暂无'}
+游戏模式：${gameModeLabel(playMode)}
+当前回合：${room.turnNumber || 0}
+你扮演的 Bot：${JSON.stringify(fixedContext.bot)}
+你当前已提交/待命动作：${JSON.stringify(currentAction)}
+触发你的真人消息（你确实能听见/看见）：${JSON.stringify(triggerMessage)}
+你可用的玩家信息：${JSON.stringify(playerSummary)}
+历史消息上下文（越靠后越新）：${JSON.stringify(historyContext.messages)}
+
+请判断是否需要撤回当前动作并重新决策。
+应当 shouldRevise=true 的情况：
+- 玩家直接点名/呼唤你，要求你改变计划、等待、配合、回答或做别的事。
+- 玩家提供了会影响你当前行动的新信息、新计划、新危险或反对意见。
+- 你当前是待命/停止主动推进，而这条消息明显是在唤醒你或需要你参与。
+- 继续保持原动作会与队伍最新计划冲突或浪费机会。
+
+应当 shouldRevise=false 的情况：
+- 只是闲聊、重复信息、没有影响你当前行动的新内容。
+- 你无法基于信息权限听见/理解更多，或者消息与当前行动无关。
+- 重新决策只会刷屏、拖慢游戏或抢玩家节奏。
+
+返回 JSON：{"shouldRevise":true/false,"reason":"简短说明"}`,
+    },
+  ];
+
+  try {
+    const payload = await callOpenAICompatible(messages, { temperature: 0.45, timeoutMs: 30000 });
+    return normalizeBotRevisionDecision(payload, fallback);
+  } catch (error) {
+    console.error('[llm] bot revision decision failed after retries:', error);
+    throw error;
+  }
 }
 
 export async function generateBotTurnDecision({ room, bot, recentMessages, step = 1, maxSteps = 4, inquiryRemaining = 0 }) {

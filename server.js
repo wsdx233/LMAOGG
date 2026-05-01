@@ -11,7 +11,7 @@ import bcrypt from 'bcryptjs';
 import { Server } from 'socket.io';
 
 import { createUser, findUserById, findUserByUsername } from './src/store.js';
-import { generateBotAction, generateBotChatReply, generateBotTurnDecision, generateGameSetup, generateGmInquiryReply, generateTurnNarration, getTurnTimeoutMs } from './src/llm.js';
+import { generateBotAction, generateBotChatReply, generateBotRevisionDecision, generateBotTurnDecision, generateGameSetup, generateGmInquiryReply, generateTurnNarration, getTurnTimeoutMs } from './src/llm.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
@@ -1436,7 +1436,7 @@ function eligibleBotChatResponders(room, triggerMessage) {
   const attempted = new Set(Array.isArray(triggerMessage.botChatAttemptedResponderIds) ? triggerMessage.botChatAttemptedResponderIds : []);
   const now = Date.now();
   const candidates = [...room.players.values()].filter((player) => {
-    if (!player.isBot || attempted.has(player.id) || !botCanHearChatMessage(room, player, triggerMessage)) return false;
+    if (!player.isBot || player.proactiveStopped || attempted.has(player.id) || !botCanHearChatMessage(room, player, triggerMessage)) return false;
     if (botMentionedInText(player, triggerMessage.text)) return true;
     return now - Number(player.lastBotChatAt || 0) >= BOT_CHAT_COOLDOWN_MS;
   });
@@ -1551,16 +1551,47 @@ function withdrawBotActionForRevision(room, bot, triggerMessage) {
   return true;
 }
 
-function wakeOrReviseBotsByMessage(room, triggerMessage) {
+async function botWantsRevisionFromMessage(room, bot, triggerMessage) {
+  const turn = room?.currentTurn;
+  if (!turn?.actions?.has(bot.id)) return false;
+  const currentAction = turn.actions.get(bot.id);
+  const recentMessages = (isPrivateInfoMode(room) ? room.messages.filter((message) => messageVisibleToViewer(message, bot.id)) : room.messages)
+    .map((message) => llmMessageContext(room, message));
+  const triggerContext = {
+    id: triggerMessage.id,
+    userId: triggerMessage.userId || '',
+    ...llmMessageContext(room, triggerMessage),
+  };
+
+  try {
+    const decision = await generateBotRevisionDecision({
+      room,
+      bot,
+      triggerMessage: triggerContext,
+      currentAction: {
+        text: currentAction.text,
+        passive: Boolean(currentAction.passive),
+        createdAt: currentAction.createdAt,
+        location: currentAction.location || normalizeLocation(bot.location),
+      },
+      recentMessages,
+    });
+    return Boolean(decision?.shouldRevise);
+  } catch (error) {
+    console.error('[bot] revision decision failed:', error);
+    return false;
+  }
+}
+
+async function wakeOrReviseBotsByMessage(room, triggerMessage) {
   if (!room || !triggerMessage || triggerMessage.isBot || !isChatMessageType(triggerMessage)) return false;
   let shouldRunBots = false;
   for (const bot of room.players.values()) {
     if (!bot?.isBot || !botCanHearChatMessage(room, bot, triggerMessage)) continue;
-    if (bot.proactiveStopped) {
-      bot.proactiveStopped = false;
-      if (withdrawBotActionForRevision(room, bot, triggerMessage)) shouldRunBots = true;
-      continue;
-    }
+    if (!canBotReviseTurnAction(room, bot, triggerMessage)) continue;
+    const shouldRevise = await botWantsRevisionFromMessage(room, bot, triggerMessage);
+    if (!shouldRevise) continue;
+    if (bot.proactiveStopped) bot.proactiveStopped = false;
     if (withdrawBotActionForRevision(room, bot, triggerMessage)) shouldRunBots = true;
   }
   if (shouldRunBots) emitRoom(room);
@@ -1586,7 +1617,7 @@ async function submitBotChatResponses(roomId, triggerMessageId) {
   if (!room || room.status === 'starting') return;
   const triggerMessage = room.messages.find((message) => message.id === triggerMessageId);
   if (!triggerMessage || !isChatMessageType(triggerMessage)) return;
-  const shouldRunBotsAfterChat = wakeOrReviseBotsByMessage(room, triggerMessage);
+  const shouldRunBotsAfterChat = await wakeOrReviseBotsByMessage(room, triggerMessage);
 
   triggerMessage.botChatAttemptedResponderIds = Array.isArray(triggerMessage.botChatAttemptedResponderIds)
     ? triggerMessage.botChatAttemptedResponderIds
