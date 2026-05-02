@@ -63,13 +63,14 @@ LLM_MAX_RETRIES=3
 LLM_THINKING_EFFORT=high
 LLM_DEBUG_LOG=false
 LLM_DEBUG_LOG_FILE=data/llm-debug.log
+LLM_ERROR_RESPONSE_PREVIEW_CHARS=12000
 ```
 
 也可以配置 DeepSeek / OpenRouter / SiliconFlow 等 OpenAI-compatible 服务，只需修改 `LLM_BASE_URL` 与 `LLM_MODEL`。
 
 LLM 调用失败时会自动重试 `LLM_MAX_RETRIES` 次；仍失败则暂停在当前阶段，不会切换到本地 Mock。开局失败可由房主再次点击开始，回合结算/Bot 行动失败可由房主点击“重试 LLM”。
 
-排查 Provider / Prompt 问题时可设置 `LLM_DEBUG_LOG=true`：控制台会输出截断后的 LLM 请求/响应详情，`LLM_DEBUG_LOG_FILE` 指定的日志文件会写入未截断的完整请求/响应正文（不会记录 API Key，但仍可能包含完整剧情、玩家输入与角色秘密，请勿在生产环境随意开启或提交日志）。
+排查 Provider / Prompt 问题时可设置 `LLM_DEBUG_LOG=true`：控制台会输出截断后的 LLM 请求/响应详情，`LLM_DEBUG_LOG_FILE` 指定的日志文件会写入未截断的完整请求/响应正文（不会记录 API Key，但仍可能包含完整剧情、玩家输入与角色秘密，请勿在生产环境随意开启或提交日志）。如果 Provider 返回的 HTTP 响应体本身不是 JSON（例如报 `LLM response was not valid JSON`），或最终 `message.content` 不是合法 JSON，服务端控制台会自动打印原始响应预览，预览长度由 `LLM_ERROR_RESPONSE_PREVIEW_CHARS` 控制。
 
 ## 项目结构
 

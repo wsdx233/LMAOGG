@@ -20,6 +20,7 @@ const DEFAULT_LOCATION = { id: 'together', label: '同一地点' };
 const PERCEPTION_BLOCKED_STATUS_RE = /(死亡|休克|昏迷|晕倒|无意识|失去意识|沉睡)/;
 const MAX_TOOL_JSON_RETRY_REQUESTS = 3;
 const LLM_DEBUG_CONSOLE_STRING_LIMIT = 700;
+const DEFAULT_LLM_ERROR_RESPONSE_PREVIEW_CHARS = 12000;
 let llmDebugLogWarned = false;
 
 function envFlag(name) {
@@ -40,6 +41,34 @@ function llmDebugLogEnabled() {
 
 function llmDebugLogFile() {
   return path.resolve(process.env.LLM_DEBUG_LOG_FILE || path.join('data', 'llm-debug.log'));
+}
+
+function getLlmErrorResponsePreviewChars() {
+  const value = Number(process.env.LLM_ERROR_RESPONSE_PREVIEW_CHARS ?? DEFAULT_LLM_ERROR_RESPONSE_PREVIEW_CHARS);
+  return Number.isFinite(value) && value >= 0 ? Math.floor(value) : DEFAULT_LLM_ERROR_RESPONSE_PREVIEW_CHARS;
+}
+
+function formatRawLlmResponseForConsole(value) {
+  const raw = String(value ?? '');
+  if (!raw) return '[empty response body]';
+
+  const limit = getLlmErrorResponsePreviewChars();
+  if (limit === 0) return '[hidden by LLM_ERROR_RESPONSE_PREVIEW_CHARS=0]';
+  return raw.length > limit
+    ? `${raw.slice(0, limit)}…[truncated ${raw.length - limit} chars; set LLM_ERROR_RESPONSE_PREVIEW_CHARS higher or LLM_DEBUG_LOG=true for full body]`
+    : raw;
+}
+
+function logInvalidJsonResponse({ kind = 'response-json-parse-error', error, rawText, meta = {}, rawLabel = 'Raw LLM response body' } = {}) {
+  const message = error instanceof Error ? error.message : String(error || 'unknown error');
+  const raw = String(rawText ?? '');
+  const preview = formatRawLlmResponseForConsole(raw);
+  console.error(`[llm] ${kind}: ${message}. ${rawLabel} (${raw.length} chars):\n${preview}`);
+  writeLlmDebugLog(kind, {
+    ...meta,
+    error: message,
+    body: raw,
+  });
 }
 
 function truncateForConsole(value, limit = LLM_DEBUG_CONSOLE_STRING_LIMIT, depth = 0) {
@@ -287,17 +316,43 @@ function extractJson(content) {
   const raw = String(content || '').trim();
   if (!raw) throw new Error('LLM returned empty content');
 
+  let lastError = null;
   try {
     return JSON.parse(raw);
-  } catch {
-    const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-    if (fenced?.[1]) return JSON.parse(fenced[1]);
-
-    const first = raw.indexOf('{');
-    const last = raw.lastIndexOf('}');
-    if (first >= 0 && last > first) return JSON.parse(raw.slice(first, last + 1));
-    throw new Error('LLM response did not contain valid JSON');
+  } catch (error) {
+    lastError = error;
   }
+
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) {
+    try {
+      return JSON.parse(fenced[1]);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  const first = raw.indexOf('{');
+  const last = raw.lastIndexOf('}');
+  if (first >= 0 && last > first) {
+    try {
+      return JSON.parse(raw.slice(first, last + 1));
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  logInvalidJsonResponse({
+    kind: 'message-content-json-parse-error',
+    error: lastError,
+    rawText: raw,
+    rawLabel: 'Raw LLM message content',
+  });
+  const message = lastError instanceof Error ? lastError.message : String(lastError || 'no JSON object found');
+  const reason = first >= 0 || fenced?.[1]
+    ? `LLM response content was not valid JSON: ${message}`
+    : 'LLM response did not contain valid JSON';
+  throw new Error(`${reason}. Raw response content has been printed to the server console.`);
 }
 
 function randomToolDefinition() {
@@ -516,7 +571,18 @@ async function requestChatCompletion(body, { signal }) {
   try {
     payload = JSON.parse(responseText);
   } catch (error) {
-    throw new Error(`LLM response was not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+    const message = error instanceof Error ? error.message : String(error);
+    logInvalidJsonResponse({
+      error,
+      rawText: responseText,
+      meta: {
+        ...(response.llmDebugMeta || { requestId }),
+        status: response.status,
+        statusText: response.statusText,
+        contentType: response.headers.get('content-type') || '',
+      },
+    });
+    throw new Error(`LLM response was not valid JSON: ${message}. Raw response body has been printed to the server console.`);
   }
   const message = payload?.choices?.[0]?.message;
   if (!message) throw new Error('LLM response missing choices[0].message');
