@@ -887,9 +887,9 @@ function updateComposer(room) {
   const viewerCanPerceive = viewer?.condition?.canPerceive !== false;
   const privateMode = PRIVATE_INFO_MODES.has(room.playMode || room.game?.playMode);
 
-  dom.sendChatButton.textContent = privateMode ? '说话' : '发送聊天';
+  dom.sendChatButton.textContent = privateMode ? '说话' : '聊天';
   dom.askGmButton.textContent = '询问';
-  dom.submitActionButton.textContent = submitted ? (canWithdraw ? '撤销行动' : '已提交') : (privateMode ? '行动' : '提交行动');
+  dom.submitActionButton.textContent = submitted ? (canWithdraw ? '撤销' : '完成') : (privateMode ? '行动' : '行动');
   dom.submitActionButton.classList.toggle('danger-btn', submitted && canWithdraw);
   dom.submitActionButton.classList.toggle('primary-btn', !(submitted && canWithdraw));
   dom.progressTrack.classList.toggle('hidden', !inPlayingTurn);
