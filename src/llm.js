@@ -636,9 +636,9 @@ function setupOptionsPrompt(setupOptions = {}) {
   const mode = ['brief', 'detailed'].includes(setupOptions?.mode) ? setupOptions.mode : 'random';
   const playMode = normalizeGameMode(setupOptions?.playMode);
   const playModeLine = playMode === 'independent'
-    ? '游戏模式：独立模式。玩家有共同目标，但信息不自动共享；每名玩家只知道自己的角色信息、目标、物品、状态和所处空间。剧情更真实，结局需要评选一名 MVP。'
+    ? '游戏模式：独立模式。玩家有共同目标，但信息不自动共享；每名玩家只知道自己的角色信息、目标、物品、状态和所处空间。开局位置根据剧情需要安排，可以同处、分散或按线索分组；结局需要评选一名 MVP。'
     : playMode === 'pvp'
-      ? '游戏模式：PVP 模式。玩家目标各不相同；你可以分配阵营合作、组织对抗、间谍/背叛者、隐藏身份、竞速目标等玩法。所有秘密目标、身份、组织关系都只写入对应玩家的个人目标/角色信息，不要在公开开场泄露。'
+      ? '游戏模式：PVP 模式。PVP 不等于所有人各自为战：可以是多个阵营对抗、临时同盟、同阵营中混入卧底/背叛者、竞速争夺、双面身份或隐藏胜利条件。目标可以是个人目标、阵营目标或二者结合；同阵营玩家的目标可以相同或互补。最终可以个人胜利、多人共同胜利、阵营胜利、卧底独赢/双赢或无人胜利，不要强行只有一个赢家。所有秘密目标、身份、阵营/卧底关系都只写入对应玩家的个人目标/角色信息，不要在公开开场泄露。开局位置根据剧情需要安排，可以同处、分散或按阵营/地点分组。'
       : '游戏模式：合作模式。玩家信息共享，围绕共同目标协作冒险。';
   if (mode === 'brief') {
     return `${playModeLine}\n开局生成模式：一句话描述生成。房主描述：${clampText(setupOptions.brief, 260)}。请优先围绕这句话生成原创世界、目标、角色与开场。`;
@@ -695,8 +695,8 @@ function mockGameSetup(players, setupOptions = {}) {
   }
 
   if (playMode === 'pvp') {
-    globalGoal = `公开局势：围绕“${globalGoal}”展开竞争与博弈；每名玩家另有由 GM 私下分配的真实目标。`;
-    tone = `${tone}；隐藏身份、阵营博弈、允许有限背叛。`;
+    globalGoal = `公开局势：围绕“${globalGoal}”展开竞争与博弈；玩家可能拥有个人目标、阵营目标或隐藏卧底目标。`;
+    tone = `${tone}；阵营博弈、隐藏身份、允许有限背叛，也允许同阵营共同胜利。`;
   } else if (playMode === 'independent') {
     tone = `${tone}；独立视角、空间隔离、信息不自动共享，结局评选 MVP。`;
   }
@@ -709,10 +709,10 @@ function mockGameSetup(players, setupOptions = {}) {
     players: players.map((player, index) => {
       const location = locations[index % locations.length];
       const pvpGoal = index % 3 === 0
-        ? '暗中确保自己所属组织率先夺得关键物，同时不要暴露阵营。'
+        ? '所属阵营目标：确保己方率先夺得关键物；若同阵营成员也完成目标，可共同胜利。'
         : index % 3 === 1
-          ? '阻止任何单一组织独占关键物，并找出至少一名隐藏对手。'
-          : '作为双面线人，把冲突引向自己最有利的结局。';
+          ? '所属阵营目标：阻止对手阵营独占关键物，并找出至少一名隐藏卧底。'
+          : '隐藏卧底目标：表面协助当前阵营，暗中把冲突引向自己真正效忠方最有利的结局。';
       return {
         username: player.username,
         role: playMode === 'pvp' ? `${archetypes[index % archetypes.length]}（隐藏阵营待揭）` : archetypes[index % archetypes.length],
@@ -1457,9 +1457,9 @@ export async function generateGameSetup(players, setupOptions = {}) {
   const playerDescriptions = players.map((player) => ({ username: player.username, isBot: Boolean(player.isBot) }));
   const playMode = normalizeGameMode(setupOptions?.playMode);
   const privateSetupRequirements = playMode === 'independent'
-    ? '独立模式要求：仍然设计共同目标；但玩家信息不共享。为每名玩家设置初始 location（空间/地点）；openingNarration 只写所有人可知道的公开开场，不泄露个人目标/物品/秘密；privateOpenings 必须为每名玩家分别写自己的开局视角，只包含该玩家应知道的信息。结局时 GM 会评选 MVP。'
+    ? '独立模式要求：仍然设计共同目标；但玩家信息不共享。为每名玩家设置初始 location（空间/地点），位置应服务剧情需要：可以同处、分散、成对/分组或按线索分布，不要默认所有人必须在同一地点，也不要无意义地强行分散。openingNarration 只写所有人可知道的公开开场，不泄露个人目标/物品/秘密；privateOpenings 必须为每名玩家分别写自己的开局视角，只包含该玩家应知道的信息。结局时 GM 会评选 MVP。'
     : playMode === 'pvp'
-      ? 'PVP 模式要求：公开局势可以相同，但每名玩家的 personalGoal 必须各不相同；可分配阵营、组织对抗、间谍、双面身份、竞速目标或隐藏胜利条件。所有秘密阵营/真实目标/隐藏身份只能写入对应玩家的 role/personalGoal/privateOpenings，openingNarration 不得泄露。为每名玩家设置初始 location（空间/地点），可把玩家分成若干空间组。'
+      ? 'PVP 模式要求：公开局势可以相同，但 PVP 不必设计成所有人完全各自为战。你可以设计多个阵营对抗、同阵营协作、阵营内卧底/背叛者、双面身份、临时同盟、竞速目标或隐藏胜利条件。personalGoal 可以是个人目标、阵营目标或二者结合；同阵营玩家的目标可以相同或互补，不必强行每个人都完全不同。最终结算可以是个人胜利、多人共同胜利、阵营胜利、卧底独赢/双赢或无人胜利。所有秘密阵营/真实目标/隐藏身份/卧底关系只能写入对应玩家的 role/personalGoal/privateOpenings，openingNarration 不得泄露。为每名玩家设置初始 location（空间/地点），位置应服务剧情需要：可以同处、分散、按阵营分组、按任务线分组或把卧底放入目标阵营，不要默认所有人必须在同一地点。'
       : '合作模式要求：玩家围绕共同目标协作，信息默认共享。';
   const messages = [
     {
@@ -1468,7 +1468,7 @@ export async function generateGameSetup(players, setupOptions = {}) {
     },
     {
       role: 'user',
-      content: `${setupOptionsPrompt(setupOptions)}\n\n请为一个在线多人 LLM 文字冒险生成开局，尽可能有创意。玩家信息：${JSON.stringify(playerDescriptions)}。用户名列表：${JSON.stringify(usernames)}。isBot=true 表示该角色是 LLM Bot 队友，也需要像正常队友一样生成角色，但可以适当设定为更愿意协作、补位和辅助。\n模式细则：${privateSetupRequirements}\n要求：\n1. 原创、强钩子、适合回合制多人协作/博弈。\n2. 自动生成游戏背景设定、公开目标/共同目标、每个玩家的角色设定/个人目标/初始物品/状态标签/属性/初始空间 location。\n3. 每个角色 stats 必须包含 hp 与 stamina：hp 的 label 是“生命值”，stamina 的 label 是“体力”。你可以按世界观自定义额外属性，格式类似(但是自由创作，不要只用这些例子，否则会导致游戏重复且单调) mana(label“魔力值”)、hunger(label“饱食度”)、oxygen(label“氧气”)。自定义属性请使用英文 key + 中文 label。\n4. 开场播报要直接把玩家带入可行动场景，并暗示下一步选择；独立/PVP 模式下 openingNarration 只能包含公开信息。\n5. 中文输出。\n\n返回 JSON 结构：\n{\n  "title": "短标题",\n  "setting": "世界与当前处境",\n  "globalGoal": "合作/独立模式写共同目标；PVP 模式写公开局势或公开目标，真实目标写入玩家 personalGoal",\n  "tone": "叙事风格",\n  "players": [{\n    "username":"必须等于给定用户名",\n    "role":"角色身份；PVP 可包含该玩家自己的隐藏身份/阵营",\n    "personalGoal":"个人目标；PVP 必须各不相同且可包含秘密胜利条件",\n    "inventory":["物品1","物品2"],\n    "statusTags":["清醒"],\n    "location":{"id":"space-a","label":"空间/地点名"},\n    "stats": {\n      "hp":{"label":"生命值","value":10,"max":10},\n      "stamina":{"label":"体力","value":10,"max":10},\n      "mana":{"label":"魔力值","value":3,"max":6}\n    }\n  }],\n  "openingNarration": "公开开场 GM 播报",\n  "privateOpenings": [{"username":"玩家名", "narration":"独立/PVP 必填：该玩家自己的开局视角；合作模式可为空数组"}]\n}`,
+      content: `${setupOptionsPrompt(setupOptions)}\n\n请为一个在线多人 LLM 文字冒险生成开局，尽可能有创意。玩家信息：${JSON.stringify(playerDescriptions)}。用户名列表：${JSON.stringify(usernames)}。isBot=true 表示该角色是 LLM Bot 队友，也需要像正常队友一样生成角色，但可以适当设定为更愿意协作、补位和辅助。\n模式细则：${privateSetupRequirements}\n要求：\n1. 原创、强钩子、适合回合制多人协作/博弈。\n2. 自动生成游戏背景设定、公开目标/共同目标、每个玩家的角色设定/个人目标或阵营目标/初始物品/状态标签/属性/初始空间 location；独立/PVP 的初始位置必须按剧情需要安排，可同处、分散或分组。\n3. 每个角色 stats 必须包含 hp 与 stamina：hp 的 label 是“生命值”，stamina 的 label 是“体力”。你可以按世界观自定义额外属性，格式类似(但是自由创作，不要只用这些例子，否则会导致游戏重复且单调) mana(label“魔力值”)、hunger(label“饱食度”)、oxygen(label“氧气”)。自定义属性请使用英文 key + 中文 label。\n4. 开场播报要直接把玩家带入可行动场景，并暗示下一步选择；独立/PVP 模式下 openingNarration 只能包含公开信息。\n5. 中文输出。\n\n返回 JSON 结构：\n{\n  "title": "短标题",\n  "setting": "世界与当前处境",\n  "globalGoal": "合作/独立模式写共同目标；PVP 模式写公开局势/公开胜利条件，秘密个人目标、阵营目标、卧底目标写入玩家 personalGoal",\n  "tone": "叙事风格",\n  "players": [{\n    "username":"必须等于给定用户名",\n    "role":"角色身份；PVP 可包含该玩家自己的隐藏身份/阵营",\n    "personalGoal":"个人目标或阵营目标；PVP 可写个人胜利条件、阵营胜利条件、同阵营共同目标或卧底目标，同阵营玩家可相同/互补，不必强行完全不同",\n    "inventory":["物品1","物品2"],\n    "statusTags":["清醒"],\n    "location":{"id":"space-a","label":"空间/地点名"},\n    "stats": {\n      "hp":{"label":"生命值","value":10,"max":10},\n      "stamina":{"label":"体力","value":10,"max":10},\n      "mana":{"label":"魔力值","value":3,"max":6}\n    }\n  }],\n  "openingNarration": "公开开场 GM 播报",\n  "privateOpenings": [{"username":"玩家名", "narration":"独立/PVP 必填：该玩家自己的开局视角；合作模式可为空数组"}]\n}`,
     },
   ];
 
@@ -1519,6 +1519,9 @@ export async function generateTurnNarration({ room, actions, timedOutUsers, unab
   const mvpRequirement = playMode === 'independent'
     ? '- 如果 gameOver 为 true，必须给出 mvp：选择一名 MVP，并说明贡献理由。\n'
     : '';
+  const pvpEndingRequirement = playMode === 'pvp'
+    ? '- PVP 结局不要求只有一个人胜利：根据开局设定和实际行动，可以是个人胜利、多人共同胜利、阵营胜利、同盟胜利、卧底独赢/双赢或无人胜利。若多个角色达成相同/兼容目标，应在 ending 中明确写出胜利阵营/胜利者名单、失败方和原因；不要强行评一个唯一赢家。\n'
+    : '';
 
   const messages = [
     {
@@ -1527,7 +1530,7 @@ export async function generateTurnNarration({ room, actions, timedOutUsers, unab
     },
     {
       role: 'user',
-      content: `游戏标题：${room.game?.title}\n世界设定：${room.game?.setting}\n公开目标/局势：${room.game?.globalGoal}\n游戏模式：${gameModeLabel(playMode)}\n当前回合：${room.turnNumber}\n玩家权威状态（服务器记录，以此为准；包含真实角色/目标/物品/状态/空间，仅 GM 可见）：${JSON.stringify(playerSummary)}\n当前空间分组（同组才能自然听见说话/看见近处行动）：${JSON.stringify(locationGroups)}\n历史消息上下文（按估算 token 预算尽量纳入，越靠后越新；say 消息的 audienceUsernames 是实际听见的人）：${JSON.stringify(historyContext.messages)}\n历史消息纳入情况：${JSON.stringify({ totalMessages: historyContext.totalMessages, includedMessages: historyContext.includedMessages, omittedOlderMessages: historyContext.omittedOlderMessages, estimatedMessageTokens: historyContext.estimatedMessageTokens, messageTokenBudget: historyContext.messageTokenBudget, totalContextTokenBudget: historyContext.totalContextTokenBudget })}\n本回合行动（仅代表玩家尝试，不代表事实已成立；location 是提交行动时所在空间）：${JSON.stringify(actions)}\n超时未行动玩家：${JSON.stringify(timedOutUsers)}\n因死亡/体力耗尽/昏迷等无法行动玩家：${JSON.stringify(unableUsers)}\n\n服务器规则：\n- hp/生命值 <= 0 会死亡并无法行动。某些世界观可以复活；只要通过故事进展工具把 hp 调回 >0，就会从死亡中恢复。\n- stamina/体力 <= 0 会进入“力竭”并无法行动；但如果角色只是因体力耗尽倒下，且没有“受伤/重伤/流血/骨折/中毒/休克/昏迷”等伤病或无意识状态，应允许短暂喘息后的自然体力恢复。注意：体力刚在上一个结算中清零的角色，下一回合会先保持力竭，不能立刻呼吸恢复；通常隔过至少 1 个回合后再用 statsDelta 或 statsSet 把 stamina 恢复到至少 1，并移除“力竭”。\n- 低体力（本回合行动里的 lowStamina=true、状态含“体力不足”、或 stamina 仅剩约 25% 以下）不是“没有影响”：角色仍可行动，但奔跑、攀爬、战斗、施法、强行搬运、连续搜索等高消耗/高风险行动应明显更吃力，成功率降低、效果打折、需要 roll_random 检定，或通过 storyProgressToolCalls 造成额外 stamina/hp 消耗、疲惫/摔倒/喘不过气等状态。\n- “休克”是用于重击、坠落、爆震、严重创伤、窒息等导致晕倒/意识中断的状态开关：需要时用 statusAdd:["休克"]（可配合 hp/stamina 变化）；休克/昏迷/晕倒会无法行动且无法感知，持续应比单纯力竭更久，通常需要同伴唤醒、急救、稳定体征或安全环境后才能用 statusRemove 移除。\n- 状态标签包含“休克/昏迷/晕倒/无意识/无法行动/瘫痪/石化/沉睡/眩晕/麻痹”等会无法行动；其中休克/昏迷/晕倒/沉睡/死亡还代表无法获取外界信息。\n- 物品栏、状态标签、属性数值、位置的真实改变，必须放在 storyProgressToolCalls 中；只在 narration/privateNarrations/stateChanges 里描述不会改变服务器状态。凡是播报里写“受伤、流血、中毒、昏迷、休克、死亡、力竭、恢复、获得/失去物品、移动/分散/汇合、消耗资源”等，都必须有对应 updateCharacter 工具调用；如果没有工具调用，就不要把它写成已发生事实。\n- 工具使用倾向：只要存在风险、不确定成败、对抗、搜索发现、躲避、说服、战斗、伤害、治疗、资源消耗、获得/丢失物品、状态改变或空间移动，就优先使用工具。概率/检定/风险事件先调用 roll_random；生命值、体力、额外属性、物品栏、状态标签和位置变化必须写入 storyProgressToolCalls。位置变化写在对应 updateCharacter.args.location（如 {"id":"archive","label":"档案室"}）。\n- storyProgressToolCalls 是必填且不能为空；即使本回合确实没有任何服务器状态变化，也必须放入 {"tool":"recordNoStateChange","args":{"reason":"说明为什么没有状态变化但剧情仍有推进"}}，否则服务器会判为格式错误并重试。\n\n请输出下一段 GM 播报。要求：\n- 汇总所有有效行动并给出后果；对越权编造事实的行动要纠正为“尝试”并按背景和客观事实裁定。\n- ${privateMode ? '必须为每一名玩家输出 privateNarrations；每段严格按该玩家视角写，只包含其所在空间可见/可听、自己已知、或通过明确通信手段获得的信息。对休克/昏迷/晕倒/沉睡/死亡等无感知角色，只能写意识中断、黑暗、断片体感或等待救助，不能让其听见、看见、推理或获取外界新信息。绝对不要泄露其他空间行动、秘密目标、隐藏身份、未听到的说话或未观察到的状态变化。narration 字段只能写 GM 内部摘要/公开安全摘要。' : '合作模式下 narration 是全队可见播报。'}\n- 如果有人超时或无法行动，用剧情方式轻微体现但不要羞辱。\n- 结尾给出清晰的新局势/可行动钩子，让仍可行动玩家下一回合都有事可做。\n- 主动、频繁地使用 storyProgressToolCalls 调整角色的生命值、体力、额外属性、物品栏、状态标签和 location。常见行动可消耗 stamina，受伤扣 hp 并添加伤势状态，获得/丢失物品修改 inventory，移动/分散/汇合修改 location；低体力角色行动要体现惩罚或额外代价；不要让这些变化只停留在 narration/privateNarrations/stateChanges。\n- storyProgressToolCalls 必须至少有 1 项：有状态变化就用 updateCharacter；没有任何状态变化就用 recordNoStateChange。\n${mvpRequirement}\n- 可以让危险升级，但不要突然结束，除非剧情自然达成目标。\n- 中文，生动但精炼。\n\n最终返回 JSON：\n{\n  "narration": "合作模式的全队播报；独立/PVP 可写公开安全摘要，不要含秘密",${privateOutputSchema}\n  "stateChanges": "状态变化摘要",\n  "storyProgressToolCalls": [\n    {\n      "tool":"updateCharacter",\n      "args":{\n        "username":"玩家名",\n        "reason":"为什么这样修改",\n        "statsDelta":{"hp":-2,"stamina":-1,"mana":-1},\n        "statsSet":{"hunger":{"label":"饱食度","value":3,"max":6}},\n        "inventoryAdd":["新物品"],\n        "inventoryRemove":["消耗或丢失的物品"],\n        "statusAdd":["受伤"],\n        "statusRemove":["力竭"],\n        "location":{"id":"new-space", "label":"新空间/地点名"}\n      }\n    },\n    {\n      "tool":"recordNoStateChange",\n      "args":{"reason":"当且仅当没有任何状态变化时使用：说明为什么无状态变化但剧情仍推进；实际输出至少保留 updateCharacter 或 recordNoStateChange 其中一项"}\n    }\n  ],\n  "spotlight": {"username":"可选被聚焦玩家", "text":"可选聚焦内容"} 或 null,\n  "gameOver": false,\n  "ending": "如果 gameOver 为 true，填写结局；否则空字符串",\n  "mvp": {"username":"独立模式 gameOver=true 时填写 MVP 玩家名", "reason":"评选理由"} 或 null\n}`,
+      content: `游戏标题：${room.game?.title}\n世界设定：${room.game?.setting}\n公开目标/局势：${room.game?.globalGoal}\n游戏模式：${gameModeLabel(playMode)}\n当前回合：${room.turnNumber}\n玩家权威状态（服务器记录，以此为准；包含真实角色/目标/物品/状态/空间，仅 GM 可见）：${JSON.stringify(playerSummary)}\n当前空间分组（同组才能自然听见说话/看见近处行动）：${JSON.stringify(locationGroups)}\n历史消息上下文（按估算 token 预算尽量纳入，越靠后越新；say 消息的 audienceUsernames 是实际听见的人）：${JSON.stringify(historyContext.messages)}\n历史消息纳入情况：${JSON.stringify({ totalMessages: historyContext.totalMessages, includedMessages: historyContext.includedMessages, omittedOlderMessages: historyContext.omittedOlderMessages, estimatedMessageTokens: historyContext.estimatedMessageTokens, messageTokenBudget: historyContext.messageTokenBudget, totalContextTokenBudget: historyContext.totalContextTokenBudget })}\n本回合行动（仅代表玩家尝试，不代表事实已成立；location 是提交行动时所在空间）：${JSON.stringify(actions)}\n超时未行动玩家：${JSON.stringify(timedOutUsers)}\n因死亡/体力耗尽/昏迷等无法行动玩家：${JSON.stringify(unableUsers)}\n\n服务器规则：\n- hp/生命值 <= 0 会死亡并无法行动。某些世界观可以复活；只要通过故事进展工具把 hp 调回 >0，就会从死亡中恢复。\n- stamina/体力 <= 0 会进入“力竭”并无法行动；但如果角色只是因体力耗尽倒下，且没有“受伤/重伤/流血/骨折/中毒/休克/昏迷”等伤病或无意识状态，应允许短暂喘息后的自然体力恢复。注意：体力刚在上一个结算中清零的角色，下一回合会先保持力竭，不能立刻呼吸恢复；通常隔过至少 1 个回合后再用 statsDelta 或 statsSet 把 stamina 恢复到至少 1，并移除“力竭”。\n- 低体力（本回合行动里的 lowStamina=true、状态含“体力不足”、或 stamina 仅剩约 25% 以下）不是“没有影响”：角色仍可行动，但奔跑、攀爬、战斗、施法、强行搬运、连续搜索等高消耗/高风险行动应明显更吃力，成功率降低、效果打折、需要 roll_random 检定，或通过 storyProgressToolCalls 造成额外 stamina/hp 消耗、疲惫/摔倒/喘不过气等状态。\n- “休克”是用于重击、坠落、爆震、严重创伤、窒息等导致晕倒/意识中断的状态开关：需要时用 statusAdd:["休克"]（可配合 hp/stamina 变化）；休克/昏迷/晕倒会无法行动且无法感知，持续应比单纯力竭更久，通常需要同伴唤醒、急救、稳定体征或安全环境后才能用 statusRemove 移除。\n- 状态标签包含“休克/昏迷/晕倒/无意识/无法行动/瘫痪/石化/沉睡/眩晕/麻痹”等会无法行动；其中休克/昏迷/晕倒/沉睡/死亡还代表无法获取外界信息。\n- 物品栏、状态标签、属性数值、位置的真实改变，必须放在 storyProgressToolCalls 中；只在 narration/privateNarrations/stateChanges 里描述不会改变服务器状态。凡是播报里写“受伤、流血、中毒、昏迷、休克、死亡、力竭、恢复、获得/失去物品、移动/分散/汇合、消耗资源”等，都必须有对应 updateCharacter 工具调用；如果没有工具调用，就不要把它写成已发生事实。\n- 工具使用倾向：只要存在风险、不确定成败、对抗、搜索发现、躲避、说服、战斗、伤害、治疗、资源消耗、获得/丢失物品、状态改变或空间移动，就优先使用工具。概率/检定/风险事件先调用 roll_random；生命值、体力、额外属性、物品栏、状态标签和位置变化必须写入 storyProgressToolCalls。位置变化写在对应 updateCharacter.args.location（如 {"id":"archive","label":"档案室"}）。\n- storyProgressToolCalls 是必填且不能为空；即使本回合确实没有任何服务器状态变化，也必须放入 {"tool":"recordNoStateChange","args":{"reason":"说明为什么没有状态变化但剧情仍有推进"}}，否则服务器会判为格式错误并重试。\n\n请输出下一段 GM 播报。要求：\n- 汇总所有有效行动并给出后果；对越权编造事实的行动要纠正为“尝试”并按背景和客观事实裁定。\n- ${privateMode ? '必须为每一名玩家输出 privateNarrations；每段严格按该玩家视角写，只包含其所在空间可见/可听、自己已知、或通过明确通信手段获得的信息。对休克/昏迷/晕倒/沉睡/死亡等无感知角色，只能写意识中断、黑暗、断片体感或等待救助，不能让其听见、看见、推理或获取外界新信息。绝对不要泄露其他空间行动、秘密目标、隐藏身份、未听到的说话或未观察到的状态变化。narration 字段只能写 GM 内部摘要/公开安全摘要。' : '合作模式下 narration 是全队可见播报。'}\n- 如果有人超时或无法行动，用剧情方式轻微体现但不要羞辱。\n- 结尾给出清晰的新局势/可行动钩子，让仍可行动玩家下一回合都有事可做。\n- 主动、频繁地使用 storyProgressToolCalls 调整角色的生命值、体力、额外属性、物品栏、状态标签和 location。常见行动可消耗 stamina，受伤扣 hp 并添加伤势状态，获得/丢失物品修改 inventory，移动/分散/汇合修改 location；低体力角色行动要体现惩罚或额外代价；不要让这些变化只停留在 narration/privateNarrations/stateChanges。\n- storyProgressToolCalls 必须至少有 1 项：有状态变化就用 updateCharacter；没有任何状态变化就用 recordNoStateChange。\n${mvpRequirement}${pvpEndingRequirement}\n- 可以让危险升级，但不要突然结束，除非剧情自然达成目标。\n- 中文，生动但精炼。\n\n最终返回 JSON：\n{\n  "narration": "合作模式的全队播报；独立/PVP 可写公开安全摘要，不要含秘密",${privateOutputSchema}\n  "stateChanges": "状态变化摘要",\n  "storyProgressToolCalls": [\n    {\n      "tool":"updateCharacter",\n      "args":{\n        "username":"玩家名",\n        "reason":"为什么这样修改",\n        "statsDelta":{"hp":-2,"stamina":-1,"mana":-1},\n        "statsSet":{"hunger":{"label":"饱食度","value":3,"max":6}},\n        "inventoryAdd":["新物品"],\n        "inventoryRemove":["消耗或丢失的物品"],\n        "statusAdd":["受伤"],\n        "statusRemove":["力竭"],\n        "location":{"id":"new-space", "label":"新空间/地点名"}\n      }\n    },\n    {\n      "tool":"recordNoStateChange",\n      "args":{"reason":"当且仅当没有任何状态变化时使用：说明为什么无状态变化但剧情仍推进；实际输出至少保留 updateCharacter 或 recordNoStateChange 其中一项"}\n    }\n  ],\n  "spotlight": {"username":"可选被聚焦玩家", "text":"可选聚焦内容"} 或 null,\n  "gameOver": false,\n  "ending": "如果 gameOver 为 true，填写结局；PVP 可写个人/多人/阵营/卧底胜利或无人胜利及理由；否则空字符串",\n  "mvp": {"username":"独立模式 gameOver=true 时填写 MVP 玩家名", "reason":"评选理由"} 或 null\n}`,
     },
   ];
 
