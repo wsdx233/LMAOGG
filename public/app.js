@@ -157,6 +157,37 @@ async function api(path, options = {}) {
   return payload;
 }
 
+function filenameFromContentDisposition(header, fallback) {
+  const text = String(header || '');
+  const utf8 = text.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8?.[1]) {
+    try { return decodeURIComponent(utf8[1]); } catch { return utf8[1]; }
+  }
+  const plain = text.match(/filename="?([^";]+)"?/i);
+  return plain?.[1] || fallback;
+}
+
+async function downloadGameHistory(roomId, format) {
+  const safeFormat = format === 'txt' ? 'txt' : 'json';
+  const response = await fetch(`/api/rooms/${encodeURIComponent(roomId)}/history?format=${safeFormat}`, {
+    credentials: 'same-origin',
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.error || `下载失败：${response.status}`);
+  }
+  const blob = await response.blob();
+  const filename = filenameFromContentDisposition(response.headers.get('Content-Disposition'), `magol-history.${safeFormat}`);
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
 function setAuthMode(mode) {
   state.authMode = mode;
   dom.loginTab.classList.toggle('active', mode === 'login');
@@ -767,6 +798,31 @@ function renderAwardMessage(message) {
   return item;
 }
 
+function renderHistoryDownloadActions(message) {
+  const info = message.historyDownload || {};
+  const roomId = info.roomId || state.currentRoom?.id;
+  const formats = Array.isArray(info.formats) && info.formats.length ? info.formats : ['json', 'txt'];
+  const actions = el('div', 'history-download-actions');
+  for (const format of formats) {
+    const safeFormat = format === 'txt' ? 'txt' : 'json';
+    const button = el('button', 'history-download-btn', safeFormat.toUpperCase());
+    button.type = 'button';
+    button.addEventListener('click', async () => {
+      try {
+        button.disabled = true;
+        await downloadGameHistory(roomId, safeFormat);
+        showToast(`${safeFormat.toUpperCase()} 记录已开始下载。`, 'success');
+      } catch (error) {
+        showToast(error.message, 'error');
+      } finally {
+        button.disabled = false;
+      }
+    });
+    actions.append(button);
+  }
+  return actions;
+}
+
 function renderMessages(room) {
   clear(dom.messageList);
   if (!room.messages?.length) {
@@ -787,7 +843,7 @@ function renderMessages(room) {
       continue;
     }
 
-    const item = el('article', `message ${type}`);
+    const item = el('article', `message ${type}${message.historyDownload ? ' history-download' : ''}`);
     const author = type === 'gm' ? 'LLM GM' : type === 'system' ? '系统' : message.username || '玩家';
     const label = type === 'action' ? '行动' : type === 'ask' ? '询问' : type === 'say' ? '说话' : type === 'chat' ? '聊天' : type === 'gm' ? (message.inquiryId ? '回答' : '播报') : '系统';
 
@@ -802,6 +858,7 @@ function renderMessages(room) {
     meta.append(el('span', '', formatClock(message.createdAt)));
     const text = el('div', 'message-text', message.text);
     body.append(meta, text);
+    if (message.historyDownload) body.append(renderHistoryDownloadActions(message));
     item.append(body);
     dom.messageList.append(item);
   }

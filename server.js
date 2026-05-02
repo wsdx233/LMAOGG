@@ -17,7 +17,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
 const MAX_PLAYERS = 8;
 const MAX_ROOMS = 80;
-const MAX_MESSAGES_PER_ROOM = 220;
+const MAX_CLIENT_MESSAGES_PER_ROOM = 220;
 const MAX_BOTS_PER_ROOM = 4;
 const MAX_BOT_CHAT_RESPONSES_PER_MESSAGE = 2;
 const MAX_BOT_CHAT_CHAIN_DEPTH = 2;
@@ -140,6 +140,14 @@ app.post('/api/login', (req, res) => {
 
 app.post('/api/logout', requireAuth, (req, res) => {
   req.session.destroy(() => res.json({ ok: true }));
+});
+
+app.get('/api/rooms/:roomId/history', requireAuth, (req, res) => {
+  try {
+    sendGameHistoryDownload(req, res);
+  } catch (error) {
+    res.status(500).json({ error: errorMessage(error) });
+  }
 });
 
 function nowIso() {
@@ -501,9 +509,6 @@ function appendMessage(room, type, text, extra = {}) {
     ...safeExtra,
   };
   room.messages.push(message);
-  if (room.messages.length > MAX_MESSAGES_PER_ROOM) {
-    room.messages.splice(0, room.messages.length - MAX_MESSAGES_PER_ROOM);
-  }
   return message;
 }
 
@@ -910,10 +915,13 @@ function serializeMessageForViewer(message, viewerId) {
   return safe;
 }
 
-function messagesForViewer(room, viewerId) {
-  return (room.messages || [])
-    .filter((message) => messageVisibleToViewer(message, viewerId))
-    .map((message) => serializeMessageForViewer(message, viewerId));
+function messagesForViewer(room, viewerId, { limit = MAX_CLIENT_MESSAGES_PER_ROOM } = {}) {
+  const visibleMessages = (room.messages || [])
+    .filter((message) => messageVisibleToViewer(message, viewerId));
+  const limitedMessages = limit === false
+    ? visibleMessages
+    : visibleMessages.slice(-clampNumber(limit, MAX_CLIENT_MESSAGES_PER_ROOM, 1, 5000));
+  return limitedMessages.map((message) => serializeMessageForViewer(message, viewerId));
 }
 
 function llmMessageContext(room, message) {
@@ -1105,6 +1113,8 @@ function serializeRoom(room, viewerId) {
     playModeLabel: gameModeLabel(playMode),
     isPrivateInfoMode: privateMode,
     llmError: room.llmError || null,
+    completedAt: room.completedAt || null,
+    historyReady: Boolean(room.completedAt),
     locationGroups: privateMode
       ? (viewerCanPerceive
           ? locationGroups(room).map((group) => ({
@@ -1211,6 +1221,8 @@ function serializeRoomForPersistence(room) {
     game: room.game || null,
     playMode: normalizeGameMode(room.game?.playMode || room.playMode),
     llmError: room.llmError || null,
+    completedAt: room.completedAt || null,
+    completionSummary: room.completionSummary || '',
     turnNumber: room.turnNumber || 0,
     currentTurn: status === 'playing' ? serializeTurnForPersistence(room.currentTurn) : null,
     persistedAt: nowIso(),
@@ -1303,10 +1315,12 @@ function loadPersistedRooms() {
       maxPlayers: clampNumber(raw.maxPlayers, MAX_PLAYERS, 1, MAX_PLAYERS),
       createdAt: raw.createdAt || nowIso(),
       players: new Map(),
-      messages: Array.isArray(raw.messages) ? raw.messages.slice(-MAX_MESSAGES_PER_ROOM) : [],
+      messages: Array.isArray(raw.messages) ? raw.messages : [],
       game: raw.game || null,
       playMode: normalizeGameMode(raw.game?.playMode || raw.playMode),
       llmError: raw.llmError || null,
+      completedAt: raw.completedAt || null,
+      completionSummary: normalizeStateText(raw.completionSummary || '', 1200),
       turnNumber: Number(raw.turnNumber || 0),
       currentTurn: null,
     };
@@ -2165,6 +2179,8 @@ function createRoom(user) {
     game: null,
     playMode: 'cooperative',
     turnNumber: 0,
+    completedAt: null,
+    completionSummary: '',
     currentTurn: null,
   };
   room.players.set(user.id, makePlayerRecord(user));
@@ -2318,6 +2334,139 @@ function appendSpotlight(room, spotlight) {
   appendMessage(room, 'system', `聚光灯：${spotlight.text}`, { recipients: [player.id], privateTo: player.username, visibilityLabel: '仅你可见' });
 }
 
+function appendGameHistoryDownloadMessage(room) {
+  appendMessage(room, 'system', '本次冒险已经结束，完整游戏记录已保存在服务器本地。你可以下载当前权限下可见的 JSON 或 TXT 记录。', {
+    title: '游戏记录已生成',
+    visibilityLabel: '可下载',
+    historyDownload: {
+      roomId: room.id,
+      formats: ['json', 'txt'],
+    },
+  });
+}
+
+function safeDownloadName(input, fallback = 'magol-history') {
+  const clean = normalizeStateText(input, 90)
+    .replace(/[\\/:*?"<>|\x00-\x1f]+/g, '-')
+    .replace(/\s+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return clean || fallback;
+}
+
+function statSummary(stats = {}) {
+  return Object.values(stats || {})
+    .map((stat) => `${stat.label || '属性'} ${stat.value ?? '?'}/${stat.max ?? '?'}`)
+    .join('，');
+}
+
+function buildGameHistoryRecord(room, viewerId) {
+  const view = serializeRoom(room, viewerId);
+  return {
+    exportedAt: nowIso(),
+    viewer: view.players.find((player) => player.id === viewerId)?.username || '',
+    room: {
+      id: room.id,
+      name: room.name,
+      hostName: room.hostName,
+      status: room.status,
+      createdAt: room.createdAt,
+      completedAt: room.completedAt || null,
+      completionSummary: room.completionSummary || '',
+      turnNumber: room.turnNumber || 0,
+      playMode: normalizeGameMode(room.game?.playMode || room.playMode),
+      playModeLabel: gameModeLabel(room.game?.playMode || room.playMode),
+    },
+    game: view.game,
+    players: view.players,
+    messages: messagesForViewer(room, viewerId, { limit: false }),
+  };
+}
+
+function formatHistoryMessage(message) {
+  const time = message.createdAt ? new Date(message.createdAt).toLocaleString('zh-CN', { hour12: false }) : '';
+  const type = message.type || 'chat';
+  const author = type === 'gm' ? 'LLM GM' : type === 'system' || type === 'state' ? '系统' : message.username || '玩家';
+  const label = type === 'action' ? '行动' : type === 'ask' ? '询问' : type === 'say' ? '说话' : type === 'chat' ? '聊天' : type === 'gm' ? (message.inquiryId ? '回答' : '播报') : type === 'state' ? '状态变化' : type === 'award' ? '奖项' : '系统';
+  const visibility = message.visibilityLabel || message.audienceLabel || message.privateTo || '';
+  const prefix = `[${time}] ${label}${visibility ? `（${visibility}）` : ''}｜${author}`;
+
+  if (type === 'state' && Array.isArray(message.events) && message.events.length) {
+    const details = message.events
+      .map((event) => `  - ${event.summary || `${event.username || '角色'}：${(event.changes || []).map(summarizeStateChange).filter(Boolean).join('；')}`}`)
+      .join('\n');
+    return `${prefix}\n${message.text || message.summary || '状态发生变化。'}\n${details}`;
+  }
+  if (type === 'award') {
+    return `${prefix}\n${message.title || 'MVP'}：${message.mvp?.username || '未揭晓'}\n${message.mvp?.reason || message.text || ''}`.trim();
+  }
+  return `${prefix}\n${message.text || ''}`;
+}
+
+function buildGameHistoryText(record) {
+  const lines = [];
+  lines.push(`MAGOL 游戏记录`);
+  lines.push(`导出时间：${record.exportedAt}`);
+  lines.push(`下载视角：${record.viewer || '未知玩家'}`);
+  lines.push('');
+  lines.push(`房间：${record.room.name}（${record.room.id}）`);
+  lines.push(`房主：${record.room.hostName}`);
+  lines.push(`模式：${record.room.playModeLabel}`);
+  lines.push(`状态：${record.room.status}`);
+  if (record.room.completedAt) lines.push(`完成时间：${record.room.completedAt}`);
+  if (record.room.completionSummary) lines.push(`结局摘要：${record.room.completionSummary}`);
+  lines.push(`回合数：${record.room.turnNumber}`);
+  lines.push('');
+
+  if (record.game) {
+    lines.push(`标题：${record.game.title || '未命名冒险'}`);
+    lines.push(`世界设定：${record.game.setting || '暂无'}`);
+    lines.push(`目标/局势：${record.game.globalGoal || '暂无'}`);
+    lines.push(`风格：${record.game.tone || '暂无'}`);
+    lines.push('');
+  }
+
+  lines.push('玩家与角色');
+  for (const player of record.players || []) {
+    lines.push(`- ${player.username}${player.isBot ? '（Bot）' : ''}：${player.role || '未知角色'}｜${player.condition?.label || ''}`);
+    if (player.personalGoal) lines.push(`  目标：${player.personalGoal}`);
+    if (player.location?.label) lines.push(`  位置：${player.location.label}`);
+    if (player.stats) lines.push(`  属性：${statSummary(player.stats) || '未知'}`);
+    if (Array.isArray(player.statusTags) && player.statusTags.length) lines.push(`  状态：${player.statusTags.join('、')}`);
+    if (Array.isArray(player.inventory) && player.inventory.length) lines.push(`  物品：${player.inventory.join('、')}`);
+  }
+  lines.push('');
+  lines.push('消息记录');
+  lines.push('='.repeat(28));
+  for (const message of record.messages || []) {
+    lines.push(formatHistoryMessage(message));
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+
+function historyDownloadFilename(room, format) {
+  const title = room.game?.title || room.name || room.id;
+  const day = new Date().toISOString().slice(0, 10);
+  return `${safeDownloadName(title)}-${room.id}-${day}.${format}`;
+}
+
+function sendGameHistoryDownload(req, res) {
+  const roomId = String(req.params.roomId || '').toUpperCase();
+  const room = rooms.get(roomId);
+  if (!room || !room.players.has(req.user.id)) return res.status(404).json({ error: '房间不存在或你不在这个房间中。' });
+  if (!room.completedAt) return res.status(400).json({ error: '本次冒险尚未完成，暂时不能下载完整游戏记录。' });
+
+  const format = String(req.query.format || 'json').toLowerCase() === 'txt' ? 'txt' : 'json';
+  const record = buildGameHistoryRecord(room, req.user.id);
+  const filename = historyDownloadFilename(room, format);
+  res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
+  if (format === 'txt') {
+    res.type('text/plain; charset=utf-8').send(buildGameHistoryText(record));
+    return;
+  }
+  res.type('application/json; charset=utf-8').send(JSON.stringify(record, null, 2));
+}
+
 async function startGame(roomId, starterId, rawSetupOptions = {}) {
   const room = rooms.get(roomId);
   if (!room) throw new Error('房间不存在。');
@@ -2334,6 +2483,8 @@ async function startGame(roomId, starterId, rawSetupOptions = {}) {
   room.llmError = null;
   room.turnNumber = 0;
   room.game = null;
+  room.completedAt = null;
+  room.completionSummary = '';
   room.playMode = setupOptions.playMode;
   appendMessage(room, 'system', `${restarting ? '房主决定重新开始。' : '房主按下了巨大的 START 按钮。'}游戏模式：${gameModeLabel(setupOptions.playMode)}；开局模式：${setupModeLabel(setupOptions)}。LLM 正在生成世界、角色与目标……`);
   emitRoom(room);
@@ -2689,7 +2840,9 @@ async function resolveTurn(roomId, reason = 'manual') {
   if (result.gameOver) {
     currentRoom.status = 'ended';
     currentRoom.currentTurn = null;
-    appendMessage(currentRoom, 'gm', result.ending || '冒险暂告一段落。', { username: 'LLM GM', visibilityLabel: '结局公开' });
+    currentRoom.completedAt = nowIso();
+    currentRoom.completionSummary = result.ending || '冒险暂告一段落。';
+    appendMessage(currentRoom, 'gm', currentRoom.completionSummary, { username: 'LLM GM', visibilityLabel: '结局公开' });
     if (normalizeGameMode(currentRoom.game?.playMode) === 'independent' && result.mvp?.username) {
       appendMessage(currentRoom, 'award', result.mvp.reason || 'LLM GM 评定的本局 MVP。', {
         username: 'LLM GM',
@@ -2697,6 +2850,7 @@ async function resolveTurn(roomId, reason = 'manual') {
         mvp: result.mvp,
       });
     }
+    appendGameHistoryDownloadMessage(currentRoom);
     emitRoom(currentRoom);
     return;
   }
