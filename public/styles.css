@@ -1278,6 +1278,8 @@ textarea:focus {
 .turn-progress.resolving .turn-progress-fill {
   width: 100% !important;
   background: repeating-linear-gradient(45deg, var(--violet) 0 12px, var(--sky) 12px 24px);
+  /* 24px stripe cycle at 45deg => 24 * sqrt(2), keep the loop seamless. */
+  background-size: 33.941125px 33.941125px;
   animation: barber 0.8s linear infinite;
 }
 
@@ -1290,8 +1292,11 @@ textarea:focus {
 }
 
 @keyframes barber {
+  from {
+    background-position: 0 0;
+  }
   to {
-    background-position: 34px 0;
+    background-position: 33.941125px 0;
   }
 }
 
