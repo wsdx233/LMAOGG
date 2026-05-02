@@ -30,6 +30,7 @@ const BOT_WAIT_DEFAULT_MS = 8000;
 const BOT_WAIT_MIN_MS = 1000;
 const BOT_WAIT_MAX_MS = 30000;
 const BOT_WAIT_WAKE_CHAT_SUPPRESS_MS = 2500;
+const EXHAUSTION_REST_TURN_MS = 8000;
 const ROOMS_FILE = path.resolve('data', 'rooms.json');
 const USERNAME_RE = /^[\p{L}\p{N}_-]{3,20}$/u;
 const DEFAULT_STATS = {
@@ -38,6 +39,8 @@ const DEFAULT_STATS = {
 };
 const SHOCK_STATUS_RE = /(休克|昏迷|晕倒|无意识|失去意识|沉睡)/;
 const EXHAUSTION_STATUS_RE = /(力竭|体力耗尽|精疲力尽|脱力|虚脱)/;
+const LOW_STAMINA_STATUS_TAG = '体力不足';
+const LOW_STAMINA_RATIO = 0.25;
 const INJURY_STATUS_RE = /(受伤|重伤|轻伤|流血|出血|骨折|内伤|创伤|伤口|烧伤|冻伤|中毒|感染|濒死)/;
 const DISABLING_STATUS_RE = /(休克|昏迷|晕倒|无意识|失去意识|无法行动|瘫痪|石化|沉睡|眩晕|麻痹)/;
 const RESUMABLE_PAUSE_KINDS = new Set(['missing', 'no-human']);
@@ -335,6 +338,21 @@ function hasInjuryStatus(player) {
   return hasStatusMatching(player, INJURY_STATUS_RE);
 }
 
+function staminaInfo(player) {
+  const stats = normalizeStats(player?.stats);
+  const stat = stats.stamina || DEFAULT_STATS.stamina;
+  const max = Math.max(1, Number(stat.max || 1));
+  const value = clampNumber(stat.value, 0, 0, max);
+  const lowThreshold = Math.max(1, Math.ceil(max * LOW_STAMINA_RATIO));
+  return {
+    value,
+    max,
+    lowThreshold,
+    ratio: value / max,
+    isLow: value > 0 && value <= lowThreshold,
+  };
+}
+
 function applyVitalsRules(player) {
   player.stats = normalizeStats(player.stats);
   player.statusTags = normalizeStatusTags(player.statusTags);
@@ -342,23 +360,44 @@ function applyVitalsRules(player) {
 
   const hp = player.stats.hp?.value ?? 0;
   const stamina = player.stats.stamina?.value ?? 0;
+  const staminaState = staminaInfo(player);
   if (hp <= 0) addStatusTag(player, '死亡');
   else removeStatusTag(player, '死亡');
 
-  if (hp > 0 && stamina <= 0) addStatusTag(player, '力竭');
-  else if (stamina > 0) {
+  if (hp > 0 && stamina <= 0) {
+    addStatusTag(player, '力竭');
+    removeStatusTag(player, LOW_STAMINA_STATUS_TAG);
+  } else if (stamina > 0) {
     for (const tag of normalizeStatusTags(player.statusTags)) {
       if (EXHAUSTION_STATUS_RE.test(tag)) removeStatusTag(player, tag);
     }
+    if (hp > 0 && staminaState.isLow) addStatusTag(player, LOW_STAMINA_STATUS_TAG);
+    else removeStatusTag(player, LOW_STAMINA_STATUS_TAG);
+  } else {
+    removeStatusTag(player, LOW_STAMINA_STATUS_TAG);
   }
 
   return player;
+}
+
+function syncStaminaDepletionMarker(player, turnNumber, beforeStaminaValue = null) {
+  const hp = player.stats?.hp?.value ?? 0;
+  const stamina = player.stats?.stamina?.value ?? 0;
+  if (hp > 0 && stamina <= 0) {
+    const current = Number(player.staminaDepletedAtTurn);
+    if (!Number.isFinite(current) || Number(beforeStaminaValue) > 0) {
+      player.staminaDepletedAtTurn = Math.max(0, Number(turnNumber || 0));
+    }
+  } else {
+    delete player.staminaDepletedAtTurn;
+  }
 }
 
 function getPlayerCondition(player) {
   applyVitalsRules(player);
   const hp = player.stats.hp?.value ?? 0;
   const stamina = player.stats.stamina?.value ?? 0;
+  const staminaState = staminaInfo(player);
   if (hp <= 0 || player.statusTags.includes('死亡')) {
     return { state: 'dead', label: '死亡', reason: '生命值耗尽', canAct: false, canPerceive: false };
   }
@@ -376,7 +415,20 @@ function getPlayerCondition(player) {
   if (disablingTag) {
     return { state: 'disabled', label: disablingTag, reason: `状态：${disablingTag}`, canAct: false, canPerceive: true };
   }
-  return { state: 'active', label: '可行动', reason: '', canAct: true, canPerceive: true };
+
+  if (staminaState.isLow) {
+    return {
+      state: 'tired',
+      label: LOW_STAMINA_STATUS_TAG,
+      reason: `体力偏低（${staminaState.value}/${staminaState.max}），行动更容易失败或造成额外消耗`,
+      canAct: true,
+      canPerceive: true,
+      lowStamina: true,
+      stamina: staminaState,
+    };
+  }
+
+  return { state: 'active', label: '可行动', reason: '', canAct: true, canPerceive: true, lowStamina: false, stamina: staminaState };
 }
 
 function canPlayerAct(player) {
@@ -539,7 +591,96 @@ function removeInventoryItems(player, items) {
   return removed;
 }
 
-function canNaturallyRecoverStamina(player) {
+function actionConditionSnapshot(player) {
+  const condition = getPlayerCondition(player);
+  const staminaState = staminaInfo(player);
+  return {
+    state: condition.state,
+    label: condition.label,
+    reason: condition.reason || '',
+    canAct: Boolean(condition.canAct),
+    canPerceive: condition.canPerceive !== false,
+    lowStamina: Boolean(condition.lowStamina || staminaState.isLow),
+    stamina: staminaState,
+  };
+}
+
+function makeTurnActionRecord(player, text, extra = {}) {
+  const condition = actionConditionSnapshot(player);
+  return {
+    text: trimText(text, 700),
+    createdAt: nowIso(),
+    location: normalizeLocation(player.location),
+    actionId: crypto.randomUUID(),
+    condition,
+    lowStamina: condition.lowStamina,
+    staminaAtSubmission: condition.stamina,
+    ...extra,
+  };
+}
+
+function staminaAlreadySpentInEvents(events = [], userId) {
+  return events.some((event) => event?.userId === userId && Array.isArray(event.changes) && event.changes.some((change) => (
+    change?.kind === 'stat'
+    && normalizeStatKey(change.key) === 'stamina'
+    && (Number(change.delta || 0) < 0 || Number(change.after) < Number(change.before))
+  )));
+}
+
+function isRestOrRecoveryActionText(text) {
+  return /(休息|喘息|恢复|回气|调息|原地待命|待命|坐下|躺下|休整|喝水|进食|包扎|冥想|深呼吸|保存体力|不行动|等待)/.test(String(text || ''));
+}
+
+function applyLowStaminaActionStrain(room, actions = [], priorEvents = []) {
+  if (!Array.isArray(actions) || !actions.length) return [];
+  const events = [];
+  const affected = new Set();
+
+  for (const action of actions) {
+    if (!action?.lowStamina || affected.has(action.userId) || isRestOrRecoveryActionText(action.text) || staminaAlreadySpentInEvents(priorEvents, action.userId)) continue;
+    const player = room.players.get(action.userId);
+    if (!player) continue;
+    applyVitalsRules(player);
+    const hp = player.stats.hp?.value ?? 0;
+    const previous = player.stats.stamina || { label: '体力', value: 0, max: 10 };
+    const max = Math.max(1, previous.max || 10);
+    const before = clampNumber(previous.value, 0, 0, max);
+    if (hp <= 0 || before <= 0) continue;
+
+    const beforeTags = new Set(normalizeStatusTags(player.statusTags));
+    const after = clampNumber(before - 1, Math.max(0, before - 1), 0, max);
+    if (after === before) continue;
+    player.stats.stamina = { ...previous, label: previous.label || '体力', value: after, max };
+    applyVitalsRules(player);
+    syncStaminaDepletionMarker(player, room.turnNumber || 0, before);
+
+    const changes = [{
+      kind: 'stat',
+      key: 'stamina',
+      label: player.stats.stamina.label,
+      before,
+      after,
+      max,
+      delta: after - before,
+    }];
+    const addedTags = normalizeStatusTags(player.statusTags).filter((tag) => !beforeTags.has(tag) && (tag === LOW_STAMINA_STATUS_TAG || EXHAUSTION_STATUS_RE.test(tag)));
+    if (addedTags.length) changes.push({ kind: 'status', action: 'add', tags: addedTags });
+
+    const reason = '低体力行动造成额外疲劳';
+    events.push({
+      userId: player.id,
+      username: player.username,
+      reason,
+      changes,
+      summary: `${player.username}：${reason}；${changes.map(summarizeStateChange).filter(Boolean).join('；')}`,
+    });
+    affected.add(action.userId);
+  }
+
+  return events;
+}
+
+function canEventuallyNaturallyRecoverStamina(player) {
   applyVitalsRules(player);
   const hp = player.stats.hp?.value ?? 0;
   const stamina = player.stats.stamina?.value ?? 0;
@@ -550,12 +691,20 @@ function canNaturallyRecoverStamina(player) {
   return !hardDisablingTag;
 }
 
+function canNaturallyRecoverStamina(room, player) {
+  if (!canEventuallyNaturallyRecoverStamina(player)) return false;
+  const depletedAtTurn = Number(player.staminaDepletedAtTurn);
+  const currentTurn = Number(room?.turnNumber || 0);
+  if (Number.isFinite(depletedAtTurn) && currentTurn <= depletedAtTurn + 1) return false;
+  return true;
+}
+
 function applyNaturalStaminaRecovery(room) {
   if (!room?.players?.size) return [];
   const events = [];
 
   for (const player of room.players.values()) {
-    if (!canNaturallyRecoverStamina(player)) continue;
+    if (!canNaturallyRecoverStamina(room, player)) continue;
 
     const previous = player.stats.stamina || { label: '体力', value: 0, max: 10 };
     const max = Math.max(1, previous.max || 10);
@@ -582,6 +731,7 @@ function applyNaturalStaminaRecovery(room) {
     if (removedTags.length) changes.push({ kind: 'status', action: 'remove', tags: removedTags });
 
     applyVitalsRules(player);
+    syncStaminaDepletionMarker(player, room.turnNumber || 0, before);
     events.push({
       userId: player.id,
       username: player.username,
@@ -603,11 +753,12 @@ function applyStoryToolCalls(room, calls = []) {
     if (!/updateCharacter|update_character/i.test(tool)) continue;
 
     const args = call?.args && typeof call.args === 'object' ? call.args : {};
-    const username = normalizeStateText(args.username || args.player || args.target, 80);
+    const username = normalizeStateText(args.username || args.player || args.target || args.targetUsername, 80);
     const player = [...room.players.values()].find((entry) => entry.username.toLowerCase() === username.toLowerCase());
     if (!player) continue;
 
     applyVitalsRules(player);
+    const beforeStaminaValue = player.stats.stamina?.value ?? 0;
     const changes = [];
     const reason = normalizeStateText(args.reason, 140);
 
@@ -673,6 +824,7 @@ function applyStoryToolCalls(room, calls = []) {
     }
 
     applyVitalsRules(player);
+    syncStaminaDepletionMarker(player, room.turnNumber || 0, beforeStaminaValue);
     if (changes.length) {
       const summary = `${player.username}：${reason ? `${reason}；` : ''}${changes.map(summarizeStateChange).filter(Boolean).join('；')}`;
       events.push({
@@ -1051,6 +1203,7 @@ function serializeRoomForPersistence(room) {
         statusTags: player.statusTags || [],
         stats: player.stats || defaultStats(),
         location: normalizeLocation(player.location),
+        staminaDepletedAtTurn: Number.isFinite(Number(player.staminaDepletedAtTurn)) ? Number(player.staminaDepletedAtTurn) : null,
         proactiveStopped: Boolean(player.proactiveStopped),
       };
     }),
@@ -1129,6 +1282,8 @@ function rehydrateTurn(rawTurn, room) {
 
   if (!turn.paused) {
     turn.timer = setTimeout(() => resolveTurn(room.id, 'restored-timeout'), remainingMs);
+  } else if (['no-able-players', 'bot-only'].includes(turn.pauseKind) && [...room.players.values()].some((player) => canEventuallyNaturallyRecoverStamina(player))) {
+    turn.timer = setTimeout(() => advanceExhaustionRestTurn(room.id, turn), EXHAUSTION_REST_TURN_MS);
   }
   return turn;
 }
@@ -1172,6 +1327,12 @@ function loadPersistedRooms() {
         location: normalizeLocation(player.location),
         proactiveStopped: Boolean(player.proactiveStopped),
       });
+      const persistedDepletedAt = Number(player.staminaDepletedAtTurn);
+      if (Number.isFinite(persistedDepletedAt) && (record.stats.hp?.value ?? 0) > 0 && (record.stats.stamina?.value ?? 0) <= 0) {
+        record.staminaDepletedAtTurn = persistedDepletedAt;
+      } else {
+        syncStaminaDepletionMarker(record, room.turnNumber || 0);
+      }
       room.players.set(record.id, record);
       if (!record.isBot) userRooms.set(record.id, room.id);
     }
@@ -1663,7 +1824,7 @@ function appendBotChatMessage(room, bot, text, triggerMessage) {
 
 function submitBotActionRecord(room, turn, bot, text, { passive = false } = {}) {
   const actionText = trimText(text, 700) || (passive ? `${bot.username}保持观察，等待队伍指示。` : `${bot.username}谨慎观察局势，等待最佳时机支援队伍。`);
-  const actionRecord = { text: actionText, createdAt: nowIso(), isBot: true, location: normalizeLocation(bot.location), actionId: crypto.randomUUID(), passive };
+  const actionRecord = makeTurnActionRecord(bot, actionText, { isBot: true, passive });
   turn.actions.set(bot.id, actionRecord);
   const privateAction = isPrivateInfoMode(room);
   const actionMessage = appendMessage(room, 'action', actionText, {
@@ -2218,6 +2379,7 @@ async function startGame(roomId, starterId, rawSetupOptions = {}) {
       player.location = normalizeLocation(generated.location);
       if (player.isBot) player.proactiveStopped = false;
       applyVitalsRules(player);
+      syncStaminaDepletionMarker(player, currentRoom.turnNumber || 0);
     }
   }
 
@@ -2229,6 +2391,17 @@ async function startGame(roomId, starterId, rawSetupOptions = {}) {
   return currentRoom;
 }
 
+function advanceExhaustionRestTurn(roomId, expectedTurn) {
+  const room = rooms.get(roomId);
+  if (!room || room.status !== 'playing' || room.currentTurn !== expectedTurn) return;
+  if (!expectedTurn?.paused || !['no-able-players', 'bot-only'].includes(expectedTurn.pauseKind)) return;
+  if (![...room.players.values()].some((player) => canEventuallyNaturallyRecoverStamina(player))) return;
+
+  room.turnNumber += 1;
+  appendMessage(room, 'system', '力竭的角色已经经过一个无法行动的喘息回合，检查自然恢复。');
+  beginTurn(room);
+}
+
 function beginTurn(room) {
   clearRoomTimer(room);
   const recoveryEvents = applyNaturalStaminaRecovery(room);
@@ -2238,6 +2411,7 @@ function beginTurn(room) {
   const timeoutMs = getTurnTimeoutMs();
   const startedAt = Date.now();
   if (!eligibleUserIds.length) {
+    const recoverableExhaustedPlayers = [...room.players.values()].filter((player) => canEventuallyNaturallyRecoverStamina(player));
     room.currentTurn = {
       turn: room.turnNumber,
       startedAt,
@@ -2250,18 +2424,27 @@ function beginTurn(room) {
       resolving: false,
       paused: true,
       pauseKind: 'no-able-players',
-      pauseReason: '所有角色当前都无法行动',
+      pauseReason: recoverableExhaustedPlayers.length ? '所有角色当前都力竭，正在喘息恢复' : '所有角色当前都无法行动',
       remainingMs: timeoutMs,
       totalMs: timeoutMs,
       timer: null,
     };
-    appendMessage(room, 'system', '冒险已暂停：所有角色当前都无法行动。房主可以中止后重新开始，或等待后续手动处理。');
+    if (recoverableExhaustedPlayers.length) {
+      room.currentTurn.timer = setTimeout(() => advanceExhaustionRestTurn(room.id, room.currentTurn), EXHAUSTION_REST_TURN_MS);
+      appendMessage(room, 'system', `冒险已暂停：所有角色当前都无法行动。${recoverableExhaustedPlayers.map((player) => player.username).join('、')} 会先完整经历一个力竭回合，随后尝试自然喘息恢复。`);
+    } else {
+      appendMessage(room, 'system', '冒险已暂停：所有角色当前都无法行动。房主可以中止后重新开始，或等待后续手动处理。');
+    }
     emitRoom(room);
     return;
   }
 
   const hasEligibleHuman = eligibleHumanUserIds(room, eligibleUserIds).length > 0;
   const shouldPause = !hasEligibleHuman || !areEligibleUsersPresent(room, eligibleUserIds);
+  const recoverableExhaustedPlayers = !hasEligibleHuman
+    ? [...room.players.values()].filter((player) => canEventuallyNaturallyRecoverStamina(player))
+    : [];
+  const autoRestForExhaustion = shouldPause && !hasEligibleHuman && recoverableExhaustedPlayers.length > 0;
   room.currentTurn = {
     turn: room.turnNumber,
     startedAt,
@@ -2274,11 +2457,14 @@ function beginTurn(room) {
     resolving: false,
     paused: shouldPause,
     pauseKind: shouldPause ? (hasEligibleHuman ? (hasPresentHumanPlayer(room) ? 'missing' : 'no-human') : 'bot-only') : '',
-    pauseReason: shouldPause ? (hasEligibleHuman ? '等待可行动真人玩家回到桌边' : '当前没有可行动真人角色') : '',
+    pauseReason: shouldPause ? (hasEligibleHuman ? '等待可行动真人玩家回到桌边' : (autoRestForExhaustion ? '当前没有可行动真人角色，力竭角色正在喘息恢复' : '当前没有可行动真人角色')) : '',
     remainingMs: timeoutMs,
     totalMs: timeoutMs,
     timer: shouldPause ? null : setTimeout(() => resolveTurn(room.id, 'timeout'), timeoutMs),
   };
+  if (autoRestForExhaustion) {
+    room.currentTurn.timer = setTimeout(() => advanceExhaustionRestTurn(room.id, room.currentTurn), EXHAUSTION_REST_TURN_MS);
+  }
 
   const unableNames = [...room.players.values()]
     .filter((player) => !eligibleUserIds.includes(player.id))
@@ -2293,7 +2479,9 @@ function beginTurn(room) {
   );
   if (shouldPause) {
     if (!hasEligibleHuman) {
-      appendMessage(room, 'system', '回合已强制暂停：当前可行动角色里没有真人玩家，避免只由 LLM Bot 自动推进。');
+      appendMessage(room, 'system', autoRestForExhaustion
+        ? `回合已强制暂停：当前可行动角色里没有真人玩家，避免只由 LLM Bot 自动推进。${recoverableExhaustedPlayers.map((player) => player.username).join('、')} 会先完整经历一个力竭回合，随后尝试自然喘息恢复。`
+        : '回合已强制暂停：当前可行动角色里没有真人玩家，避免只由 LLM Bot 自动推进。');
     } else {
       const missing = missingEligibleUsers(room, eligibleUserIds).join('、') || '真人玩家';
       appendMessage(room, 'system', `回合已暂停：等待 ${missing} 回到桌边后继续倒计时。`);
@@ -2452,12 +2640,19 @@ async function resolveTurn(roomId, reason = 'manual') {
   const eligibleSet = new Set(turn.eligibleUserIds || players.filter((player) => canPlayerAct(player)).map((player) => player.id));
   const actions = players
     .filter((player) => eligibleSet.has(player.id) && turn.actions.has(player.id))
-    .map((player) => ({
-      userId: player.id,
-      username: player.username,
-      text: turn.actions.get(player.id).text,
-      location: turn.actions.get(player.id).location || normalizeLocation(player.location),
-    }));
+    .map((player) => {
+      const action = turn.actions.get(player.id);
+      const condition = action.condition || actionConditionSnapshot(player);
+      return {
+        userId: player.id,
+        username: player.username,
+        text: action.text,
+        location: action.location || normalizeLocation(player.location),
+        condition,
+        lowStamina: Boolean(action.lowStamina || condition.lowStamina),
+        staminaAtSubmission: action.staminaAtSubmission || condition.stamina,
+      };
+    });
   const timedOutUsers = players.filter((player) => eligibleSet.has(player.id) && !turn.actions.has(player.id)).map((player) => player.username);
   const unableUsers = players
     .filter((player) => !eligibleSet.has(player.id))
@@ -2486,7 +2681,8 @@ async function resolveTurn(roomId, reason = 'manual') {
 
   appendGmNarration(currentRoom, result);
   const stateEvents = applyStoryToolCalls(currentRoom, result.storyProgressToolCalls || []);
-  appendStateEvents(currentRoom, stateEvents, result.stateChanges);
+  const lowStaminaEvents = applyLowStaminaActionStrain(currentRoom, actions, stateEvents);
+  appendStateEvents(currentRoom, [...stateEvents, ...lowStaminaEvents], result.stateChanges);
   appendSpotlight(currentRoom, result.spotlight);
   if (result.warning) appendMessage(currentRoom, 'system', result.warning);
 
@@ -2678,7 +2874,7 @@ io.on('connection', (socket) => {
       const text = trimText(payload?.text, 700);
       if (text.length < 1) throw new Error('行动不能为空。');
 
-      const actionRecord = { text, createdAt: nowIso(), location: normalizeLocation(player.location), actionId: crypto.randomUUID() };
+      const actionRecord = makeTurnActionRecord(player, text);
       room.currentTurn.actions.set(user.id, actionRecord);
       const privateAction = isPrivateInfoMode(room);
       const actionMessage = appendMessage(room, 'action', text, {

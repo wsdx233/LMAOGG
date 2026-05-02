@@ -759,14 +759,22 @@ function mockTurnNarration({ room, actions, timedOutUsers, unableUsers = [] }) {
         }))
       : [],
     stateChanges: '局势推进；危险与线索同时增加。',
-    storyProgressToolCalls: actions.map((action) => ({
-      tool: 'updateCharacter',
-      args: {
-        username: action.username,
-        reason: '本地 Mock：行动消耗体力。',
-        statsDelta: { stamina: -1 },
-      },
-    })),
+    storyProgressToolCalls: actions.length
+      ? actions.map((action) => {
+          const resting = /(休息|喘息|恢复|回气|调息|待命|坐下|躺下|休整|喝水|进食|冥想|深呼吸|保存体力|不行动|等待)/.test(String(action.text || ''));
+          return {
+            tool: 'updateCharacter',
+            args: {
+              username: action.username,
+              reason: resting ? '本地 Mock：休息/喘息恢复体力。' : (action.lowStamina ? '本地 Mock：低体力行动更吃力，额外消耗体力。' : '本地 Mock：行动消耗体力。'),
+              statsDelta: { stamina: resting ? 2 : (action.lowStamina ? -2 : -1) },
+            },
+          };
+        })
+      : [{
+          tool: 'recordNoStateChange',
+          args: { reason: '本地 Mock：无人提交行动，局势仅以叙事方式短暂推进。' },
+        }],
     spotlight: null,
     gameOver: false,
     ending: '',
@@ -812,6 +820,37 @@ function normalizeSetup(payload, players, setupOptions = {}) {
   };
 }
 
+function isUpdateCharacterTool(tool) {
+  return /updateCharacter|update_character/i.test(String(tool || ''));
+}
+
+function isNoStateChangeTool(tool) {
+  return /recordNoStateChange|record_no_state_change|noStateChange|no_state_change|noop|no-op/i.test(String(tool || ''));
+}
+
+function isRecognizedStoryTool(tool) {
+  return isUpdateCharacterTool(tool) || isNoStateChangeTool(tool);
+}
+
+function hasMeaningfulMutationValue(value) {
+  if (Array.isArray(value)) return value.length > 0;
+  if (value && typeof value === 'object') return Object.keys(value).length > 0;
+  if (typeof value === 'number') return Number.isFinite(value) && value !== 0;
+  return Boolean(clampText(value, 80));
+}
+
+function hasUpdateCharacterMutationArgs(args = {}) {
+  return [
+    args.statsDelta, args.statDeltas, args.deltaStats, args.attributesDelta,
+    args.statsSet, args.setStats, args.attributesSet,
+    args.inventoryAdd, args.addItems, args.itemsAdd, args.inventoryRemove, args.removeItems, args.itemsRemove,
+    args.inventory?.add, args.inventory?.remove,
+    args.statusAdd, args.addStatusTags, args.statusTagsAdd, args.statusRemove, args.removeStatusTags, args.statusTagsRemove,
+    args.statusTags?.add, args.statusTags?.remove,
+    args.location, args.locationSet, args.moveTo, args.space, args.spaceSet,
+  ].some(hasMeaningfulMutationValue);
+}
+
 function normalizeStoryToolCalls(calls) {
   if (calls === undefined || calls === null || calls === '') return [];
   let rawCalls = calls;
@@ -836,9 +875,18 @@ function normalizeStoryToolCalls(calls) {
           ? call.arguments
           : null;
       if (!args) throw new RetryableLlmFormatError(`storyProgressToolCalls[${index}].args 必须是 JSON 对象。`);
+      if (!isRecognizedStoryTool(tool)) throw new RetryableLlmFormatError(`storyProgressToolCalls[${index}].tool 未知：${tool}。只能使用 updateCharacter 或 recordNoStateChange。`);
+      if (isUpdateCharacterTool(tool) && !clampText(args.username || args.player || args.target || args.targetUsername, 80)) {
+        throw new RetryableLlmFormatError(`storyProgressToolCalls[${index}] 使用 updateCharacter 时 args.username 必填。`);
+      }
+      if (isUpdateCharacterTool(tool) && !hasUpdateCharacterMutationArgs(args)) {
+        throw new RetryableLlmFormatError(`storyProgressToolCalls[${index}] 使用 updateCharacter 时必须包含实际状态/物品/位置修改；若无状态变化请使用 recordNoStateChange。`);
+      }
+      if (isNoStateChangeTool(tool) && !clampText(args.reason || args.summary || args.note, 200)) {
+        throw new RetryableLlmFormatError(`storyProgressToolCalls[${index}] 使用 recordNoStateChange 时 args.reason 必填。`);
+      }
       return { tool, args };
     })
-    .filter((call) => /updateCharacter|update_character/i.test(call.tool))
     .slice(0, 40);
 }
 
@@ -848,6 +896,10 @@ function normalizeTurn(payload) {
     : Array.isArray(payload.playerNarrations)
       ? payload.playerNarrations
       : [];
+  const storyProgressToolCalls = normalizeStoryToolCalls(payload.storyProgressToolCalls || payload.toolCalls || payload.tools);
+  if (!storyProgressToolCalls.length) {
+    throw new RetryableLlmFormatError('storyProgressToolCalls 必须至少包含 1 个工具调用；若无任何状态变化，请调用 recordNoStateChange。');
+  }
   return {
     narration: clampText(payload.narration || payload.text || '命运短暂沉默，但冒险仍在继续。', 2400),
     privateNarrations: privateNarrations.map((entry) => ({
@@ -855,7 +907,7 @@ function normalizeTurn(payload) {
       narration: clampText(entry?.narration || entry?.text || '', 2400),
     })).filter((entry) => entry.username && entry.narration),
     stateChanges: clampText(payload.stateChanges || '', 700),
-    storyProgressToolCalls: normalizeStoryToolCalls(payload.storyProgressToolCalls || payload.toolCalls || payload.tools),
+    storyProgressToolCalls,
     spotlight: payload.spotlight && typeof payload.spotlight === 'object'
       ? {
           username: clampText(payload.spotlight.username || '', 80),
@@ -1471,11 +1523,11 @@ export async function generateTurnNarration({ room, actions, timedOutUsers, unab
   const messages = [
     {
       role: 'system',
-      content: `你是一个中文多人文字冒险 GM。根据玩家行动推进剧情：尊重玩家意图但制造代价、线索和新选择。合理地模拟虚拟世界中的交互、化用数学、逻辑学谜题创造真实需要思考解决的挑战，以及模拟虚拟世界中的NPC交流、战斗场景等。你必须尊重既有故事背景、当前状态、物品栏、状态标签、属性数值、空间位置和客观事实。玩家只能声明“尝试/意图/说的话”，不能通过行动文本编造已发生事实、NPC反应、隐藏线索、战利品、自己拥有的物品或世界规则；遇到越权编造时，应将其视为尝试、误判、谎称或失败，并给出合理后果。你应积极使用工具：凡是行动存在明显风险、不确定成败、对抗、搜索发现、躲避、说服、战斗、伤害、治疗、资源消耗、获得/丢失物品、状态改变或空间移动，都优先调用 roll_random 工具或在最终 JSON 的 storyProgressToolCalls 中记录状态/位置变更；不要只用 narration 描述状态变化。硬性要求：任何会改变服务器权威状态的叙事都必须落实为 storyProgressToolCalls 的 updateCharacter 调用；如果写“受伤/流血/中毒/昏迷/休克/死亡/力竭/恢复/获得或失去物品/移动到新地点/消耗资源”等，就必须同步写入 statsDelta 或 statsSet、statusAdd/statusRemove、inventoryAdd/inventoryRemove、location 等字段。禁止出现“文本里说受伤、服务器状态却没变化”的结果；不想改变状态就不要在播报中写成已经发生的状态变化。${privacySystem}最终只输出严格 JSON。`,
+      content: `你是一个中文多人文字冒险 GM。根据玩家行动推进剧情：尊重玩家意图但制造代价、线索和新选择。合理地模拟虚拟世界中的交互、化用数学、逻辑学谜题创造真实需要思考解决的挑战，以及模拟虚拟世界中的NPC交流、战斗场景等。你必须尊重既有故事背景、当前状态、物品栏、状态标签、属性数值、空间位置和客观事实。玩家只能声明“尝试/意图/说的话”，不能通过行动文本编造已发生事实、NPC反应、隐藏线索、战利品、自己拥有的物品或世界规则；遇到越权编造时，应将其视为尝试、误判、谎称或失败，并给出合理后果。你应积极使用工具：凡是行动存在明显风险、不确定成败、对抗、搜索发现、躲避、说服、战斗、伤害、治疗、资源消耗、获得/丢失物品、状态改变或空间移动，都优先调用 roll_random 工具或在最终 JSON 的 storyProgressToolCalls 中记录状态/位置变更；不要只用 narration 描述状态变化。硬性要求：任何会改变服务器权威状态的叙事都必须落实为 storyProgressToolCalls 的 updateCharacter 调用；如果写“受伤/流血/中毒/昏迷/休克/死亡/力竭/恢复/获得或失去物品/移动到新地点/消耗资源”等，就必须同步写入 statsDelta 或 statsSet、statusAdd/statusRemove、inventoryAdd/inventoryRemove、location 等字段。禁止出现“文本里说受伤、服务器状态却没变化”的结果；不想改变状态就不要在播报中写成已经发生的状态变化。低体力角色（行动里的 lowStamina=true 或状态含“体力不足”）虽然还能行动，但行动必须更吃力：高强度/风险动作更容易失败、打折、需要检定或造成额外体力/生命/状态代价，不能按满体力同等处理。最终 JSON 的 storyProgressToolCalls 必须至少包含 1 个工具调用；若确实没有任何服务器状态变化，也必须调用 recordNoStateChange 记录“无状态变化但局势已推进”的原因。${privacySystem}最终只输出严格 JSON。`,
     },
     {
       role: 'user',
-      content: `游戏标题：${room.game?.title}\n世界设定：${room.game?.setting}\n公开目标/局势：${room.game?.globalGoal}\n游戏模式：${gameModeLabel(playMode)}\n当前回合：${room.turnNumber}\n玩家权威状态（服务器记录，以此为准；包含真实角色/目标/物品/状态/空间，仅 GM 可见）：${JSON.stringify(playerSummary)}\n当前空间分组（同组才能自然听见说话/看见近处行动）：${JSON.stringify(locationGroups)}\n历史消息上下文（按估算 token 预算尽量纳入，越靠后越新；say 消息的 audienceUsernames 是实际听见的人）：${JSON.stringify(historyContext.messages)}\n历史消息纳入情况：${JSON.stringify({ totalMessages: historyContext.totalMessages, includedMessages: historyContext.includedMessages, omittedOlderMessages: historyContext.omittedOlderMessages, estimatedMessageTokens: historyContext.estimatedMessageTokens, messageTokenBudget: historyContext.messageTokenBudget, totalContextTokenBudget: historyContext.totalContextTokenBudget })}\n本回合行动（仅代表玩家尝试，不代表事实已成立；location 是提交行动时所在空间）：${JSON.stringify(actions)}\n超时未行动玩家：${JSON.stringify(timedOutUsers)}\n因死亡/体力耗尽/昏迷等无法行动玩家：${JSON.stringify(unableUsers)}\n\n服务器规则：\n- hp/生命值 <= 0 会死亡并无法行动。某些世界观可以复活；只要通过故事进展工具把 hp 调回 >0，就会从死亡中恢复。\n- stamina/体力 <= 0 会进入“力竭”并无法行动；但如果角色只是因体力耗尽倒下，且没有“受伤/重伤/流血/骨折/中毒/休克/昏迷”等伤病或无意识状态，应允许短暂喘息后的自然体力恢复。不要把单纯力竭写成永久昏迷或无法自然恢复；通常在 1 回合左右用 statsDelta 或 statsSet 把 stamina 恢复到至少 1，并移除“力竭”。\n- “休克”是用于重击、坠落、爆震、严重创伤、窒息等导致晕倒/意识中断的状态开关：需要时用 statusAdd:["休克"]（可配合 hp/stamina 变化）；休克/昏迷/晕倒会无法行动且无法感知，持续应比单纯力竭更久，通常需要同伴唤醒、急救、稳定体征或安全环境后才能用 statusRemove 移除。\n- 状态标签包含“休克/昏迷/晕倒/无意识/无法行动/瘫痪/石化/沉睡/眩晕/麻痹”等会无法行动；其中休克/昏迷/晕倒/沉睡/死亡还代表无法获取外界信息。\n- 物品栏、状态标签、属性数值、位置的真实改变，必须放在 storyProgressToolCalls 中；只在 narration/privateNarrations/stateChanges 里描述不会改变服务器状态。凡是播报里写“受伤、流血、中毒、昏迷、休克、死亡、力竭、恢复、获得/失去物品、移动/分散/汇合、消耗资源”等，都必须有对应 updateCharacter 工具调用；如果没有工具调用，就不要把它写成已发生事实。\n- 工具使用倾向：只要存在风险、不确定成败、对抗、搜索发现、躲避、说服、战斗、伤害、治疗、资源消耗、获得/丢失物品、状态改变或空间移动，就优先使用工具。概率/检定/风险事件先调用 roll_random；生命值、体力、额外属性、物品栏、状态标签和位置变化必须写入 storyProgressToolCalls。位置变化写在对应 updateCharacter.args.location（如 {"id":"archive","label":"档案室"}）。\n\n请输出下一段 GM 播报。要求：\n- 汇总所有有效行动并给出后果；对越权编造事实的行动要纠正为“尝试”并按背景和客观事实裁定。\n- ${privateMode ? '必须为每一名玩家输出 privateNarrations；每段严格按该玩家视角写，只包含其所在空间可见/可听、自己已知、或通过明确通信手段获得的信息。对休克/昏迷/晕倒/沉睡/死亡等无感知角色，只能写意识中断、黑暗、断片体感或等待救助，不能让其听见、看见、推理或获取外界新信息。绝对不要泄露其他空间行动、秘密目标、隐藏身份、未听到的说话或未观察到的状态变化。narration 字段只能写 GM 内部摘要/公开安全摘要。' : '合作模式下 narration 是全队可见播报。'}\n- 如果有人超时或无法行动，用剧情方式轻微体现但不要羞辱。\n- 结尾给出清晰的新局势/可行动钩子，让仍可行动玩家下一回合都有事可做。\n- 主动、频繁地使用 storyProgressToolCalls 调整角色的生命值、体力、额外属性、物品栏、状态标签和 location。常见行动可消耗 stamina，受伤扣 hp 并添加伤势状态，获得/丢失物品修改 inventory，移动/分散/汇合修改 location；不要让这些变化只停留在 narration/privateNarrations/stateChanges。\n${mvpRequirement}\n- 可以让危险升级，但不要突然结束，除非剧情自然达成目标。\n- 中文，生动但精炼。\n\n最终返回 JSON：\n{\n  "narration": "合作模式的全队播报；独立/PVP 可写公开安全摘要，不要含秘密",${privateOutputSchema}\n  "stateChanges": "状态变化摘要",\n  "storyProgressToolCalls": [\n    {\n      "tool":"updateCharacter",\n      "args":{\n        "username":"玩家名",\n        "reason":"为什么这样修改",\n        "statsDelta":{"hp":-2,"stamina":-1,"mana":-1},\n        "statsSet":{"hunger":{"label":"饱食度","value":3,"max":6}},\n        "inventoryAdd":["新物品"],\n        "inventoryRemove":["消耗或丢失的物品"],\n        "statusAdd":["受伤"],\n        "statusRemove":["力竭"],\n        "location":{"id":"new-space", "label":"新空间/地点名"}\n      }\n    }\n  ],\n  "spotlight": {"username":"可选被聚焦玩家", "text":"可选聚焦内容"} 或 null,\n  "gameOver": false,\n  "ending": "如果 gameOver 为 true，填写结局；否则空字符串",\n  "mvp": {"username":"独立模式 gameOver=true 时填写 MVP 玩家名", "reason":"评选理由"} 或 null\n}`,
+      content: `游戏标题：${room.game?.title}\n世界设定：${room.game?.setting}\n公开目标/局势：${room.game?.globalGoal}\n游戏模式：${gameModeLabel(playMode)}\n当前回合：${room.turnNumber}\n玩家权威状态（服务器记录，以此为准；包含真实角色/目标/物品/状态/空间，仅 GM 可见）：${JSON.stringify(playerSummary)}\n当前空间分组（同组才能自然听见说话/看见近处行动）：${JSON.stringify(locationGroups)}\n历史消息上下文（按估算 token 预算尽量纳入，越靠后越新；say 消息的 audienceUsernames 是实际听见的人）：${JSON.stringify(historyContext.messages)}\n历史消息纳入情况：${JSON.stringify({ totalMessages: historyContext.totalMessages, includedMessages: historyContext.includedMessages, omittedOlderMessages: historyContext.omittedOlderMessages, estimatedMessageTokens: historyContext.estimatedMessageTokens, messageTokenBudget: historyContext.messageTokenBudget, totalContextTokenBudget: historyContext.totalContextTokenBudget })}\n本回合行动（仅代表玩家尝试，不代表事实已成立；location 是提交行动时所在空间）：${JSON.stringify(actions)}\n超时未行动玩家：${JSON.stringify(timedOutUsers)}\n因死亡/体力耗尽/昏迷等无法行动玩家：${JSON.stringify(unableUsers)}\n\n服务器规则：\n- hp/生命值 <= 0 会死亡并无法行动。某些世界观可以复活；只要通过故事进展工具把 hp 调回 >0，就会从死亡中恢复。\n- stamina/体力 <= 0 会进入“力竭”并无法行动；但如果角色只是因体力耗尽倒下，且没有“受伤/重伤/流血/骨折/中毒/休克/昏迷”等伤病或无意识状态，应允许短暂喘息后的自然体力恢复。注意：体力刚在上一个结算中清零的角色，下一回合会先保持力竭，不能立刻呼吸恢复；通常隔过至少 1 个回合后再用 statsDelta 或 statsSet 把 stamina 恢复到至少 1，并移除“力竭”。\n- 低体力（本回合行动里的 lowStamina=true、状态含“体力不足”、或 stamina 仅剩约 25% 以下）不是“没有影响”：角色仍可行动，但奔跑、攀爬、战斗、施法、强行搬运、连续搜索等高消耗/高风险行动应明显更吃力，成功率降低、效果打折、需要 roll_random 检定，或通过 storyProgressToolCalls 造成额外 stamina/hp 消耗、疲惫/摔倒/喘不过气等状态。\n- “休克”是用于重击、坠落、爆震、严重创伤、窒息等导致晕倒/意识中断的状态开关：需要时用 statusAdd:["休克"]（可配合 hp/stamina 变化）；休克/昏迷/晕倒会无法行动且无法感知，持续应比单纯力竭更久，通常需要同伴唤醒、急救、稳定体征或安全环境后才能用 statusRemove 移除。\n- 状态标签包含“休克/昏迷/晕倒/无意识/无法行动/瘫痪/石化/沉睡/眩晕/麻痹”等会无法行动；其中休克/昏迷/晕倒/沉睡/死亡还代表无法获取外界信息。\n- 物品栏、状态标签、属性数值、位置的真实改变，必须放在 storyProgressToolCalls 中；只在 narration/privateNarrations/stateChanges 里描述不会改变服务器状态。凡是播报里写“受伤、流血、中毒、昏迷、休克、死亡、力竭、恢复、获得/失去物品、移动/分散/汇合、消耗资源”等，都必须有对应 updateCharacter 工具调用；如果没有工具调用，就不要把它写成已发生事实。\n- 工具使用倾向：只要存在风险、不确定成败、对抗、搜索发现、躲避、说服、战斗、伤害、治疗、资源消耗、获得/丢失物品、状态改变或空间移动，就优先使用工具。概率/检定/风险事件先调用 roll_random；生命值、体力、额外属性、物品栏、状态标签和位置变化必须写入 storyProgressToolCalls。位置变化写在对应 updateCharacter.args.location（如 {"id":"archive","label":"档案室"}）。\n- storyProgressToolCalls 是必填且不能为空；即使本回合确实没有任何服务器状态变化，也必须放入 {"tool":"recordNoStateChange","args":{"reason":"说明为什么没有状态变化但剧情仍有推进"}}，否则服务器会判为格式错误并重试。\n\n请输出下一段 GM 播报。要求：\n- 汇总所有有效行动并给出后果；对越权编造事实的行动要纠正为“尝试”并按背景和客观事实裁定。\n- ${privateMode ? '必须为每一名玩家输出 privateNarrations；每段严格按该玩家视角写，只包含其所在空间可见/可听、自己已知、或通过明确通信手段获得的信息。对休克/昏迷/晕倒/沉睡/死亡等无感知角色，只能写意识中断、黑暗、断片体感或等待救助，不能让其听见、看见、推理或获取外界新信息。绝对不要泄露其他空间行动、秘密目标、隐藏身份、未听到的说话或未观察到的状态变化。narration 字段只能写 GM 内部摘要/公开安全摘要。' : '合作模式下 narration 是全队可见播报。'}\n- 如果有人超时或无法行动，用剧情方式轻微体现但不要羞辱。\n- 结尾给出清晰的新局势/可行动钩子，让仍可行动玩家下一回合都有事可做。\n- 主动、频繁地使用 storyProgressToolCalls 调整角色的生命值、体力、额外属性、物品栏、状态标签和 location。常见行动可消耗 stamina，受伤扣 hp 并添加伤势状态，获得/丢失物品修改 inventory，移动/分散/汇合修改 location；低体力角色行动要体现惩罚或额外代价；不要让这些变化只停留在 narration/privateNarrations/stateChanges。\n- storyProgressToolCalls 必须至少有 1 项：有状态变化就用 updateCharacter；没有任何状态变化就用 recordNoStateChange。\n${mvpRequirement}\n- 可以让危险升级，但不要突然结束，除非剧情自然达成目标。\n- 中文，生动但精炼。\n\n最终返回 JSON：\n{\n  "narration": "合作模式的全队播报；独立/PVP 可写公开安全摘要，不要含秘密",${privateOutputSchema}\n  "stateChanges": "状态变化摘要",\n  "storyProgressToolCalls": [\n    {\n      "tool":"updateCharacter",\n      "args":{\n        "username":"玩家名",\n        "reason":"为什么这样修改",\n        "statsDelta":{"hp":-2,"stamina":-1,"mana":-1},\n        "statsSet":{"hunger":{"label":"饱食度","value":3,"max":6}},\n        "inventoryAdd":["新物品"],\n        "inventoryRemove":["消耗或丢失的物品"],\n        "statusAdd":["受伤"],\n        "statusRemove":["力竭"],\n        "location":{"id":"new-space", "label":"新空间/地点名"}\n      }\n    },\n    {\n      "tool":"recordNoStateChange",\n      "args":{"reason":"当且仅当没有任何状态变化时使用：说明为什么无状态变化但剧情仍推进；实际输出至少保留 updateCharacter 或 recordNoStateChange 其中一项"}\n    }\n  ],\n  "spotlight": {"username":"可选被聚焦玩家", "text":"可选聚焦内容"} 或 null,\n  "gameOver": false,\n  "ending": "如果 gameOver 为 true，填写结局；否则空字符串",\n  "mvp": {"username":"独立模式 gameOver=true 时填写 MVP 玩家名", "reason":"评选理由"} 或 null\n}`,
     },
   ];
 
@@ -1492,7 +1544,7 @@ export async function generateTurnNarration({ room, actions, timedOutUsers, unab
         if (attempt >= MAX_TOOL_JSON_RETRY_REQUESTS) throw error;
         messages.push({
           role: 'user',
-          content: '上一次回复中的 storyProgressToolCalls / toolCalls JSON 格式无效，服务器无法落库关键状态变化。请重新输出完整最终 JSON：storyProgressToolCalls 必须是数组，每项必须是 {"tool":"updateCharacter","args":{...}}，args 必须是 JSON 对象；不要把该字段写成字符串、Markdown 或自然语言。',
+          content: '上一次回复中的 storyProgressToolCalls / toolCalls JSON 格式无效或为空，服务器无法确认剧情推进。请重新输出完整最终 JSON：storyProgressToolCalls 必须是非空数组；有状态变化时使用 {"tool":"updateCharacter","args":{...}}，没有任何状态变化时使用 {"tool":"recordNoStateChange","args":{"reason":"无状态变化但剧情仍推进的原因"}}；args 必须是 JSON 对象；不要把该字段写成字符串、Markdown 或自然语言。',
         });
       }
     }
