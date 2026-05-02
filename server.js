@@ -1327,10 +1327,14 @@ function loadPersistedRooms() {
 
     for (const player of Array.isArray(raw.players) ? raw.players : []) {
       const isBot = Boolean(player?.isBot || isBotId(player?.id));
-      if (!player?.id || (!isBot && !findUserById(player.id))) continue;
+      if (!player?.id) continue;
+      const knownUser = isBot ? null : findUserById(player.id);
+      if (!isBot && !knownUser) {
+        console.warn(`[rooms] persisted player ${player.username || player.id} (${player.id}) is not present in users.json; preserving the room player instead of dropping it.`);
+      }
       const record = applyVitalsRules({
         id: player.id,
-        username: player.username || (isBot ? 'LLM队友' : findUserById(player.id)?.username) || '玩家',
+        username: player.username || (isBot ? 'LLM队友' : knownUser?.username) || '玩家',
         joinedAt: player.joinedAt || nowIso(),
         isBot,
         role: player.role || '',
