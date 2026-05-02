@@ -2335,7 +2335,10 @@ function appendSpotlight(room, spotlight) {
 }
 
 function appendGameHistoryDownloadMessage(room) {
-  appendMessage(room, 'system', '本次冒险已经结束，完整游戏记录已保存在服务器本地。你可以下载当前权限下可见的 JSON 或 TXT 记录。', {
+  const fullHistory = shouldExportFullHistory(room);
+  appendMessage(room, 'system', fullHistory
+    ? '本次 PVP 冒险已经结束，完整游戏记录已保存在服务器本地。你可以下载包含终局公开秘密与全量消息的 JSON 或 TXT 记录。'
+    : '本次冒险已经结束，完整游戏记录已保存在服务器本地。你可以下载当前权限下可见的 JSON 或 TXT 记录。', {
     title: '游戏记录已生成',
     visibilityLabel: '可下载',
     historyDownload: {
@@ -2359,11 +2362,44 @@ function statSummary(stats = {}) {
     .join('，');
 }
 
+function serializeFullHistoryPlayer(player) {
+  const condition = getPlayerCondition(player);
+  return {
+    id: player.id,
+    username: player.username,
+    isBot: Boolean(player.isBot),
+    role: player.role || '',
+    personalGoal: player.personalGoal || '',
+    inventory: player.inventory || [],
+    statusTags: player.statusTags || [],
+    stats: player.stats || defaultStats(),
+    condition,
+    location: normalizeLocation(player.location),
+    joinedAt: player.joinedAt,
+  };
+}
+
+function serializeFullHistoryMessage(room, message) {
+  const { botChatAttemptedResponderIds, ...safe } = message;
+  if (Array.isArray(safe.recipients) && safe.recipients.length) {
+    safe.recipientUsernames = safe.recipients.map((id) => room.players.get(id)?.username).filter(Boolean);
+  }
+  return safe;
+}
+
+function shouldExportFullHistory(room) {
+  return Boolean(room?.completedAt && normalizeGameMode(room.game?.playMode || room.playMode) === 'pvp');
+}
+
 function buildGameHistoryRecord(room, viewerId) {
   const view = serializeRoom(room, viewerId);
+  const playMode = normalizeGameMode(room.game?.playMode || room.playMode);
+  const fullHistory = shouldExportFullHistory(room);
   return {
     exportedAt: nowIso(),
     viewer: view.players.find((player) => player.id === viewerId)?.username || '',
+    scope: fullHistory ? 'full-pvp-after-game-over' : 'viewer-visible',
+    scopeLabel: fullHistory ? 'PVP 终局完整记录' : '当前玩家可见记录',
     room: {
       id: room.id,
       name: room.name,
@@ -2373,12 +2409,14 @@ function buildGameHistoryRecord(room, viewerId) {
       completedAt: room.completedAt || null,
       completionSummary: room.completionSummary || '',
       turnNumber: room.turnNumber || 0,
-      playMode: normalizeGameMode(room.game?.playMode || room.playMode),
-      playModeLabel: gameModeLabel(room.game?.playMode || room.playMode),
+      playMode,
+      playModeLabel: gameModeLabel(playMode),
     },
-    game: view.game,
-    players: view.players,
-    messages: messagesForViewer(room, viewerId, { limit: false }),
+    game: fullHistory ? (room.game ? { ...room.game, playMode, playModeLabel: gameModeLabel(playMode) } : null) : view.game,
+    players: fullHistory ? [...room.players.values()].map(serializeFullHistoryPlayer) : view.players,
+    messages: fullHistory
+      ? (room.messages || []).map((message) => serializeFullHistoryMessage(room, message))
+      : messagesForViewer(room, viewerId, { limit: false }),
   };
 }
 
@@ -2407,6 +2445,7 @@ function buildGameHistoryText(record) {
   lines.push(`MAGOL 游戏记录`);
   lines.push(`导出时间：${record.exportedAt}`);
   lines.push(`下载视角：${record.viewer || '未知玩家'}`);
+  lines.push(`导出范围：${record.scopeLabel || '当前玩家可见记录'}`);
   lines.push('');
   lines.push(`房间：${record.room.name}（${record.room.id}）`);
   lines.push(`房主：${record.room.hostName}`);
