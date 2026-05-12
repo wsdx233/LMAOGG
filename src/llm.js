@@ -1606,7 +1606,7 @@ export async function generateTurnNarration({ room, actions, timedOutUsers, unab
   try {
     let lastFormatError;
     for (let attempt = 1; attempt <= MAX_TOOL_JSON_RETRY_REQUESTS; attempt += 1) {
-      const payload = await callOpenAICompatible(messages, { tools: [randomToolDefinition()], maxToolRounds: 4, maxToolJsonRetryRequests: MAX_TOOL_JSON_RETRY_REQUESTS });
+      const payload = await callOpenAICompatible(messages, { tools: [randomToolDefinition()], maxToolRounds: 128, maxToolJsonRetryRequests: MAX_TOOL_JSON_RETRY_REQUESTS });
       try {
         return { ...normalizeTurn(payload), provider: providerName() };
       } catch (error) {
